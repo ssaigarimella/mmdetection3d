@@ -4,20 +4,26 @@ tools/vis_single_sample_pred_gt.py
 
 Visualize ONE sample: LiDAR points + GT boxes + predicted boxes.
 
-Now supports browsing the entire split in the SAME Open3D window:
+Browse the entire split in the SAME Open3D window:
   - Press N for next sample, B for previous
   - Press S to save a screenshot for the current sample to --out-dir
 
-Core behavior (unchanged):
-- Points shown can be:
+Points shown can be:
     * "pipeline": exactly what the model sees (from dataset pipeline / pseudo_collate)
     * "full": load the corresponding full velodyne file (velodyne/*.bin) if present
-    * "both": overlay both clouds (useful to prove reduced/frustum clipping)
+    * "both": overlay both clouds
 
-- GT boxes are taken from dataset.get_data_info(idx)["eval_ann_info"]["gt_bboxes_3d"]
-  which is evaluator-aligned (what test.py uses for KITTI-style pkls in MMDet3D).
+GT boxes are taken from dataset.get_data_info(idx)["eval_ann_info"]["gt_bboxes_3d"]
+(what test.py uses).
 
-- Box rendering reorders corners geometrically so edges aren’t “skewed” from wrong wiring.
+NEW:
+- GT_VIS_MODE controls whether to show:
+    * "all"          : all GT boxes
+    * "pipeline_fov" : keep only GT boxes that lie within the angular FOV (azimuth, elevation, range)
+                       implied by the reduced (pipeline) point cloud.
+
+Important: The FOV filter uses ONLY pipeline points + GT box corners.
+No calibs, no transforms, no "points inside box" logic.
 
 Usage:
   CFG=configs/_custom/pp_vehicle_synth_3class.py
@@ -73,6 +79,30 @@ FULL_POINTS_COLOR = (0.25, 0.55, 1.00)      # blue-ish
 
 # If True, filter GT boxes by cfg.model.voxel_layer.point_cloud_range (center-based)
 GT_RANGE_FILTER = False
+
+# Which GT boxes to show:
+#   "all"          : show all GT boxes
+#   "pipeline_fov" : keep only GT boxes inside FOV implied by reduced (pipeline) points
+GT_VIS_MODE = "pipeline_fov"   # "all" | "pipeline_fov"
+
+# ---------- FOV filter tuning (pipeline_fov) ----------
+# We define the reduced lidar FOV by the angular + range envelope of the pipeline points.
+# Use robust percentiles to avoid rare outliers expanding the FOV.
+FOV_SUBSAMPLE_MAX_POINTS = 120000   # subsample pipeline points when estimating FOV (speed)
+FOV_AZ_COVERAGE = 0.999             # fraction of points whose azimuth should be covered by the inferred interval
+FOV_EL_LOW_PCT = 0.001              # elevation lower percentile
+FOV_EL_HIGH_PCT = 0.999             # elevation upper percentile
+FOV_R_LOW_PCT = 0.001               # range lower percentile
+FOV_R_HIGH_PCT = 0.999              # range upper percentile
+
+# Margins added to the inferred FOV (to avoid over-pruning)
+FOV_AZ_MARGIN_DEG = 1.0
+FOV_EL_MARGIN_DEG = 1.0
+FOV_R_MARGIN_M = 0.5
+
+# If True, also require some part of the box to be in front of the sensor (x>0 in lidar frame).
+# Set False if your lidar frame convention is different or you want full 360 behavior.
+FOV_REQUIRE_X_POSITIVE = False
 
 # If True, automatically save screenshot on every N/B navigation (can be slow)
 AUTO_SAVE_ON_NAV = False
@@ -343,6 +373,187 @@ def filter_boxes_by_center_range(corners: np.ndarray, centers_xyz: np.ndarray, p
 
 
 # -------------------------
+# FOV filter from pipeline points (purely angular envelope)
+# -------------------------
+
+def _subsample_rows(x: np.ndarray, max_rows: int) -> np.ndarray:
+    if max_rows is None or max_rows <= 0 or x.shape[0] <= max_rows:
+        return x
+    sel = np.random.choice(x.shape[0], size=max_rows, replace=False)
+    return x[sel]
+
+
+def _minimal_circular_interval_covering(angles_rad: np.ndarray, coverage: float) -> Tuple[float, float]:
+    """
+    Find the smallest circular interval [lo, hi] on [0, 2pi) that contains
+    at least coverage fraction of angles.
+
+    Returns (lo, hi) in radians, in [0, 2pi). Interval is the shorter arc from lo to hi
+    going forward (may have hi < lo meaning wrap, but we keep lo<=hi by construction here).
+    """
+    a = np.mod(angles_rad, 2.0 * np.pi)
+    a = np.sort(a)
+    n = a.size
+    if n == 0:
+        return 0.0, 0.0
+
+    k = int(np.ceil(float(coverage) * n))
+    k = max(1, min(k, n))
+
+    a2 = np.concatenate([a, a + 2.0 * np.pi])
+
+    best_len = 1e18
+    best_lo = a[0]
+    best_hi = a[0]
+
+    for i in range(n):
+        j = i + k - 1
+        lo = a2[i]
+        hi = a2[j]
+        span = hi - lo
+        if span < best_len:
+            best_len = span
+            best_lo = lo
+            best_hi = hi
+
+    lo = np.mod(best_lo, 2.0 * np.pi)
+    hi = np.mod(best_hi, 2.0 * np.pi)
+
+    # If the best interval wrapped, represent it as a forward interval with lo>hi in wrap form.
+    # For membership tests we will use a helper that supports wrap.
+    return float(lo), float(hi)
+
+
+def _angle_in_interval(ang: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """
+    ang, lo, hi are in [0,2pi).
+    If interval does not wrap: lo <= hi, then lo <= ang <= hi.
+    If interval wraps: lo > hi, then ang >= lo OR ang <= hi.
+    """
+    ang = np.mod(ang, 2.0 * np.pi)
+    lo = float(np.mod(lo, 2.0 * np.pi))
+    hi = float(np.mod(hi, 2.0 * np.pi))
+    if lo <= hi:
+        return (ang >= lo) & (ang <= hi)
+    else:
+        return (ang >= lo) | (ang <= hi)
+
+
+def compute_pipeline_fov(
+    pts_xyz: np.ndarray,
+    subsample_max: int,
+    az_coverage: float,
+    el_low_pct: float,
+    el_high_pct: float,
+    r_low_pct: float,
+    r_high_pct: float,
+) -> Dict[str, float]:
+    """
+    Infer an (azimuth interval, elevation interval, range interval) from pipeline points.
+    All angles are in radians.
+    """
+    if pts_xyz is None or pts_xyz.shape[0] == 0:
+        return {
+            "az_lo": 0.0, "az_hi": 0.0,
+            "el_lo": 0.0, "el_hi": 0.0,
+            "r_lo": 0.0, "r_hi": 0.0,
+        }
+
+    p = _subsample_rows(pts_xyz, subsample_max)
+
+    x = p[:, 0]
+    y = p[:, 1]
+    z = p[:, 2]
+
+    r = np.sqrt(x * x + y * y + z * z) + 1e-9
+    az = np.arctan2(y, x)                 # [-pi, pi]
+    el = np.arcsin(np.clip(z / r, -1.0, 1.0))  # [-pi/2, pi/2]
+
+    az_lo, az_hi = _minimal_circular_interval_covering(az, coverage=az_coverage)
+    el_lo = float(np.quantile(el, el_low_pct))
+    el_hi = float(np.quantile(el, el_high_pct))
+    r_lo = float(np.quantile(r, r_low_pct))
+    r_hi = float(np.quantile(r, r_high_pct))
+
+    return {"az_lo": az_lo, "az_hi": az_hi, "el_lo": el_lo, "el_hi": el_hi, "r_lo": r_lo, "r_hi": r_hi}
+
+
+def filter_gt_by_pipeline_fov(
+    gt_corners: np.ndarray,
+    pts_pipeline_xyz: np.ndarray,
+    az_margin_deg: float,
+    el_margin_deg: float,
+    r_margin_m: float,
+    require_x_positive: bool,
+) -> Tuple[np.ndarray, Dict[str, float], np.ndarray]:
+    """
+    Keep GT boxes that intersect the pipeline FOV envelope in (azimuth, elevation, range).
+
+    Rule:
+      Keep a GT box if ANY of its corners falls within:
+        az in [az_lo, az_hi] (circular interval, with margin)
+        el in [el_lo, el_hi] (with margin)
+        r  in [r_lo,  r_hi ] (with margin)
+      and optionally x>0 for that corner if require_x_positive is True.
+
+    Returns:
+      (filtered_gt_corners, fov_dict_with_margins, keep_mask)
+    """
+    if gt_corners is None or gt_corners.shape[0] == 0:
+        return gt_corners, {}, np.zeros((0,), dtype=bool)
+    if pts_pipeline_xyz is None or pts_pipeline_xyz.shape[0] == 0:
+        return gt_corners[:0], {}, np.zeros((gt_corners.shape[0],), dtype=bool)
+
+    fov = compute_pipeline_fov(
+        pts_xyz=pts_pipeline_xyz,
+        subsample_max=FOV_SUBSAMPLE_MAX_POINTS,
+        az_coverage=FOV_AZ_COVERAGE,
+        el_low_pct=FOV_EL_LOW_PCT,
+        el_high_pct=FOV_EL_HIGH_PCT,
+        r_low_pct=FOV_R_LOW_PCT,
+        r_high_pct=FOV_R_HIGH_PCT,
+    )
+
+    az_margin = np.deg2rad(float(az_margin_deg))
+    el_margin = np.deg2rad(float(el_margin_deg))
+
+    az_lo = float(np.mod(fov["az_lo"] - az_margin, 2.0 * np.pi))
+    az_hi = float(np.mod(fov["az_hi"] + az_margin, 2.0 * np.pi))
+    el_lo = float(fov["el_lo"] - el_margin)
+    el_hi = float(fov["el_hi"] + el_margin)
+    r_lo = float(max(0.0, fov["r_lo"] - float(r_margin_m)))
+    r_hi = float(fov["r_hi"] + float(r_margin_m))
+
+    c = np.asarray(gt_corners, dtype=np.float64)  # (N,8,3)
+    x = c[:, :, 0]
+    y = c[:, :, 1]
+    z = c[:, :, 2]
+    r = np.sqrt(x * x + y * y + z * z) + 1e-9
+    az = np.mod(np.arctan2(y, x), 2.0 * np.pi)
+    el = np.arcsin(np.clip(z / r, -1.0, 1.0))
+
+    in_az = _angle_in_interval(az, az_lo, az_hi)         # (N,8)
+    in_el = (el >= el_lo) & (el <= el_hi)                # (N,8)
+    in_r = (r >= r_lo) & (r <= r_hi)                     # (N,8)
+
+    in_all = in_az & in_el & in_r
+
+    if require_x_positive:
+        in_all = in_all & (x > 0.0)
+
+    keep = np.any(in_all, axis=1)
+
+    fov_dbg = {
+        "az_lo": az_lo, "az_hi": az_hi,
+        "el_lo": el_lo, "el_hi": el_hi,
+        "r_lo": r_lo, "r_hi": r_hi,
+        "az_coverage": float(FOV_AZ_COVERAGE),
+    }
+
+    return gt_corners[keep], fov_dbg, keep
+
+
+# -------------------------
 # Robust LineSet creation (no corners ordering assumptions)
 # -------------------------
 
@@ -423,18 +634,18 @@ def build_scene_for_idx(
         outputs = model.test_step(data_batch)
     pred_sample = outputs[0]
 
-    # pipeline points (what model saw)
-    pts_pipeline = extract_points_from_batch(data_batch)
+    # pipeline points (what model saw) - keep raw for FOV filtering
+    pts_pipeline_raw = extract_points_from_batch(data_batch)
 
     # full points (if exist)
     pts_full, full_path_used = try_load_full_velodyne(dataset, idx)
 
-    # choose clouds
+    # choose clouds for visualization (downsampled/capped)
     pts_pipeline_vis = None
     pts_full_vis = None
 
     if points_mode in ("pipeline", "both"):
-        pts_pipeline_vis = cap_points(pts_pipeline.copy(), PIPELINE_MAX_POINTS)
+        pts_pipeline_vis = cap_points(pts_pipeline_raw.copy(), PIPELINE_MAX_POINTS)
         pts_pipeline_vis = voxel_downsample_points(pts_pipeline_vis, PIPELINE_VOXEL)
 
     if points_mode in ("full", "both"):
@@ -463,11 +674,28 @@ def build_scene_for_idx(
     gt_corners = gt_corners_from_eval_ann_info(dataset, idx)
     gt_centers = gt_centers_from_eval_ann_info(dataset, idx)
 
-    # optional GT range filter
+    gt_count_before = int(gt_corners.shape[0]) if gt_corners is not None else 0
+
+    # optional GT range filter (existing)
     if GT_RANGE_FILTER and gt_corners is not None and gt_centers is not None:
         pcr = get_voxel_point_cloud_range(cfg)
         if pcr is not None:
             gt_corners = filter_boxes_by_center_range(gt_corners, gt_centers, pcr)
+
+    # NEW: pure FOV-based GT visualization filter
+    fov_dbg = None
+    keep_mask = None
+    if GT_VIS_MODE == "pipeline_fov" and gt_corners is not None:
+        gt_corners, fov_dbg, keep_mask = filter_gt_by_pipeline_fov(
+            gt_corners=gt_corners,
+            pts_pipeline_xyz=pts_pipeline_raw,
+            az_margin_deg=FOV_AZ_MARGIN_DEG,
+            el_margin_deg=FOV_EL_MARGIN_DEG,
+            r_margin_m=FOV_R_MARGIN_M,
+            require_x_positive=FOV_REQUIRE_X_POSITIVE,
+        )
+
+    gt_count_after = int(gt_corners.shape[0]) if gt_corners is not None else 0
 
     # debug: resolved lidar path
     lp = info.get("lidar_points", {})
@@ -486,7 +714,11 @@ def build_scene_for_idx(
         "full_velodyne_resolved": full_path_used,
         "pred_kept": kept_pred,
         "pred_total": total_pred,
-        "gt_count": int(gt_corners.shape[0]) if gt_corners is not None else 0,
+        "gt_count_before": gt_count_before,
+        "gt_count": gt_count_after,
+        "gt_vis_mode": GT_VIS_MODE,
+        "fov_dbg": fov_dbg,
+        "keep_mask": keep_mask,
         "pts_pipeline_n": int(pts_pipeline_vis.shape[0]) if pts_pipeline_vis is not None else 0,
         "pts_full_n": int(pts_full_vis.shape[0]) if pts_full_vis is not None else 0,
     }
@@ -498,12 +730,24 @@ def build_scene_for_idx(
             print("[DEBUG] resolved:", lidar_resolved)
         if full_path_used is not None:
             print("[DEBUG] full velodyne resolved:", full_path_used)
-        if pts_pipeline_vis is not None:
-            print("[DEBUG] pipeline pts x[min,max]:", float(pts_pipeline_vis[:, 0].min()), float(pts_pipeline_vis[:, 0].max()))
-        if pts_full_vis is not None:
-            print("[DEBUG] full pts x[min,max]:", float(pts_full_vis[:, 0].min()), float(pts_full_vis[:, 0].max()))
-        if gt_centers is not None:
-            print("[DEBUG] gt centers x[min,max]:", float(gt_centers[:, 0].min()), float(gt_centers[:, 0].max()))
+
+        if pts_pipeline_raw is not None and pts_pipeline_raw.shape[0] > 0:
+            mn = pts_pipeline_raw.min(axis=0)
+            mx = pts_pipeline_raw.max(axis=0)
+            print("[DEBUG] pipeline RAW xyz min:", mn.tolist(), "max:", mx.tolist())
+
+        if GT_VIS_MODE == "pipeline_fov" and isinstance(fov_dbg, dict):
+            az_lo = fov_dbg["az_lo"]
+            az_hi = fov_dbg["az_hi"]
+            el_lo = fov_dbg["el_lo"]
+            el_hi = fov_dbg["el_hi"]
+            r_lo = fov_dbg["r_lo"]
+            r_hi = fov_dbg["r_hi"]
+            print("[DEBUG] inferred FOV (with margins):")
+            print("        az_lo/az_hi deg:", float(np.rad2deg(az_lo)), float(np.rad2deg(az_hi)))
+            print("        el_lo/el_hi deg:", float(np.rad2deg(el_lo)), float(np.rad2deg(el_hi)))
+            print("        r_lo/r_hi m:", float(r_lo), float(r_hi))
+            print(f"[DEBUG] kept {gt_count_after}/{gt_count_before} GT by pipeline_fov")
 
     geometries: List[o3d.geometry.Geometry] = []
     geometries.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0, origin=[0, 0, 0]))
@@ -520,7 +764,6 @@ def build_scene_for_idx(
             geometries.append(vg)
         else:
             geometries.append(pcd)
-
 
     if pts_full_vis is not None:
         pcd2 = o3d.geometry.PointCloud()
@@ -584,7 +827,7 @@ def main():
     model = init_model(cfg, args.ckpt, device=args.device)
     model.eval()
 
-    print(f"[INFO] Dataset split len={n}. Starting at dataset_idx={start_idx}. points_mode={points_mode}")
+    print(f"[INFO] Dataset split len={n}. Starting at dataset_idx={start_idx}. points_mode={points_mode} GT_VIS_MODE={GT_VIS_MODE}")
     if args.show:
         print_help()
 
@@ -625,7 +868,17 @@ def main():
             vis.poll_events()
             vis.update_renderer()
 
-            print(f"[INFO] idx={current_idx}/{n-1} sid={sid} | GT={dbg['gt_count']} | Pred kept={dbg['pred_kept']}/{dbg['pred_total']} | pts(pipeline)={dbg['pts_pipeline_n']} pts(full)={dbg['pts_full_n']}")
+            msg = (
+                f"[INFO] idx={current_idx}/{n-1} sid={sid} | "
+                f"GT={dbg['gt_count']}"
+            )
+            if dbg.get("gt_count_before", dbg["gt_count"]) != dbg["gt_count"]:
+                msg += f" (kept {dbg['gt_count']}/{dbg['gt_count_before']} by {dbg['gt_vis_mode']})"
+            msg += (
+                f" | Pred kept={dbg['pred_kept']}/{dbg['pred_total']} | "
+                f"pts(pipeline)={dbg['pts_pipeline_n']} pts(full)={dbg['pts_full_n']}"
+            )
+            print(msg)
 
             if out_dir and save_if_needed:
                 png = out_dir / f"{sid}_pred_gt.png"
@@ -655,10 +908,16 @@ def main():
             dbg = state.get("last_dbg", None)
             if isinstance(dbg, dict):
                 print(f"[INFO] current idx={dbg['idx']} sid={dbg['sid']}")
+                print(f"[INFO] GT_VIS_MODE={dbg.get('gt_vis_mode', GT_VIS_MODE)}")
                 if dbg.get("lidar_resolved") is not None:
                     print(f"[INFO] lidar_resolved: {dbg['lidar_resolved']}")
                 if dbg.get("full_velodyne_resolved") is not None:
                     print(f"[INFO] full_velodyne_resolved: {dbg['full_velodyne_resolved']}")
+                if isinstance(dbg.get("fov_dbg", None), dict):
+                    fd = dbg["fov_dbg"]
+                    print("[INFO] FOV az(deg):", float(np.rad2deg(fd["az_lo"])), float(np.rad2deg(fd["az_hi"])))
+                    print("[INFO] FOV el(deg):", float(np.rad2deg(fd["el_lo"])), float(np.rad2deg(fd["el_hi"])))
+                    print("[INFO] FOV r(m):", float(fd["r_lo"]), float(fd["r_hi"]))
             return False
 
         vis.register_key_callback(ord("N"), cb_next)
@@ -666,7 +925,7 @@ def main():
         vis.register_key_callback(ord("S"), cb_save)
         vis.register_key_callback(ord("H"), cb_help)
 
-        redraw(start_idx, save_if_needed=bool(out_dir))  # keep your old behavior: save first frame if out-dir set
+        redraw(start_idx, save_if_needed=bool(out_dir))  # keep old behavior: save first frame if out-dir set
         vis.run()
         vis.destroy_window()
         return
@@ -675,7 +934,6 @@ def main():
     if not out_dir:
         raise ValueError("If --show is off, you must provide --out-dir to save an image.")
 
-    # Build one scene and write
     sid, geoms, dbg = build_scene_for_idx(
         dataset=dataset,
         cfg=cfg,
