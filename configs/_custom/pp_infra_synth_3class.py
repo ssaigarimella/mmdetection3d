@@ -4,9 +4,10 @@ _base_ = [
     '../_base_/schedules/cyclic-40e.py', '../_base_/default_runtime.py'
 ]
 
-# point_cloud_range = [0, -39.68, -3, 69.12, 39.68, 1]
-# point_cloud_range = [-80, -80, -5, 80, 80, 5]
-point_cloud_range = [0, -39.68, -3, 92.16, 39.68, 1]
+# point_cloud_range = [0, -39.68, -3, 69.12, 39.68, 1] # original
+# point_cloud_range = [-80, -80, -5, 80, 80, 5]  # for full pcd
+# point_cloud_range = [0, -39.68, -3, 92.16, 39.68, 1]  # this is what dairv2x uses
+point_cloud_range = [0, -39.68, -10, 92.16, 39.68, 10]  # this is to get full pcd height
 
 # dataset settings
 data_root = 'data/kitti_infra/'
@@ -140,7 +141,12 @@ INFRA_ROOT = 'data/kitti_infra/'
 
 def _patch_dataloader(dl, root, ann_file, pts_prefix='training/velodyne_reduced'):
     ds = dl['dataset']
-    # Some bases use RepeatDataset: dataset=dict(type='RepeatDataset', dataset=real_ds)
+
+    # Pre-merge: your file often has ds = {'dataset': {...}} with no 'type'
+    while isinstance(ds, dict) and 'dataset' in ds and isinstance(ds['dataset'], dict) and ds.get('type') is None:
+        ds = ds['dataset']
+
+    # Post-merge: base may wrap with RepeatDataset
     if isinstance(ds, dict) and ds.get('type', None) == 'RepeatDataset' and 'dataset' in ds:
         ds = ds['dataset']
 
@@ -150,6 +156,62 @@ def _patch_dataloader(dl, root, ann_file, pts_prefix='training/velodyne_reduced'
     ds['data_prefix']['pts'] = pts_prefix
     ds['metainfo'] = metainfo
 
+
 _patch_dataloader(train_dataloader, INFRA_ROOT, 'kitti_infos_train.pkl')
 _patch_dataloader(val_dataloader,   INFRA_ROOT, 'kitti_infos_val.pkl')
 _patch_dataloader(test_dataloader,  INFRA_ROOT, 'kitti_infos_val.pkl')
+
+# put near the bottom of your config, after INFRA_ROOT is defined
+val_evaluator = dict(
+    type='KittiMetric',
+    ann_file=INFRA_ROOT + 'kitti_infos_val.pkl',
+    metric='bbox'
+)
+
+test_evaluator = dict(
+    type='KittiMetric',
+    ann_file=INFRA_ROOT + 'kitti_infos_val.pkl',
+    metric='bbox'
+)
+
+# -------------------------
+# MAKE MODEL RANGE MATCH PIPELINE RANGE
+# -------------------------
+
+# keep the original voxel size from the base PP config
+# voxel_size = [0.16, 0.16, 4] # breaks
+
+voxel_size = [0.16, 0.16, 20]
+
+# compute scatter output shape from range and voxel size
+# y: (39.68 - (-39.68)) / 0.16 = 496
+# x: (92.16 - 0) / 0.16 = 576
+output_shape = [496, 576]
+
+model = dict(
+    data_preprocessor=dict(
+        voxel_layer=dict(
+            point_cloud_range=point_cloud_range,
+            voxel_size=voxel_size,
+        )
+    ),
+    voxel_encoder=dict(
+        point_cloud_range=point_cloud_range,
+        voxel_size=voxel_size,
+    ),
+    middle_encoder=dict(
+        output_shape=output_shape
+    ),
+    bbox_head=dict(
+        anchor_generator=dict(
+            ranges=[
+                [point_cloud_range[0], point_cloud_range[1], -0.6,
+                 point_cloud_range[3], point_cloud_range[4], -0.6],
+                [point_cloud_range[0], point_cloud_range[1], -0.6,
+                 point_cloud_range[3], point_cloud_range[4], -0.6],
+                [point_cloud_range[0], point_cloud_range[1], -1.78,
+                 point_cloud_range[3], point_cloud_range[4], -1.78],
+            ],
+        )
+    )
+)

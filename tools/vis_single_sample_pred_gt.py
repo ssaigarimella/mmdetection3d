@@ -4,7 +4,11 @@ tools/vis_single_sample_pred_gt.py
 
 Visualize ONE sample: LiDAR points + GT boxes + predicted boxes.
 
-Core behavior:
+Now supports browsing the entire split in the SAME Open3D window:
+  - Press N for next sample, B for previous
+  - Press S to save a screenshot for the current sample to --out-dir
+
+Core behavior (unchanged):
 - Points shown can be:
     * "pipeline": exactly what the model sees (from dataset pipeline / pseudo_collate)
     * "full": load the corresponding full velodyne file (velodyne/*.bin) if present
@@ -13,8 +17,7 @@ Core behavior:
 - GT boxes are taken from dataset.get_data_info(idx)["eval_ann_info"]["gt_bboxes_3d"]
   which is evaluator-aligned (what test.py uses for KITTI-style pkls in MMDet3D).
 
-- Box rendering does NOT assume any specific corners ordering; it reorders corners
-  geometrically to avoid “tilted / skewed” boxes caused by wrong edge wiring.
+- Box rendering reorders corners geometrically so edges aren’t “skewed” from wrong wiring.
 
 Usage:
   CFG=configs/_custom/pp_vehicle_synth_3class.py
@@ -24,7 +27,7 @@ Usage:
     --sample-id 000002 \
     --score-thr 0.1 \
     --show \
-    --out-dir work_dirs/pp_vehicle_synth_3class/vis_single
+    --out-dir work_dirs/pp_vehicle_synth_3class/vis_browse
 """
 
 import argparse
@@ -69,8 +72,14 @@ PIPELINE_POINTS_COLOR = (0.70, 0.70, 0.70)  # gray
 FULL_POINTS_COLOR = (0.25, 0.55, 1.00)      # blue-ish
 
 # If True, filter GT boxes by cfg.model.voxel_layer.point_cloud_range (center-based)
-# Useful if you want the GT to reflect model’s effective range assumptions.
 GT_RANGE_FILTER = False
+
+# If True, automatically save screenshot on every N/B navigation (can be slow)
+AUTO_SAVE_ON_NAV = False
+
+# Render the PIPELINE cloud as voxels so it stands out over FULL points
+PIPELINE_RENDER_AS_VOXELGRID = True
+PIPELINE_RENDER_VOXEL_SIZE = 0.20   # meters; increase to 0.30 if still too thin
 
 # ============================================================
 
@@ -240,8 +249,6 @@ def try_load_full_velodyne(dataset, idx: int) -> Tuple[Optional[np.ndarray], Opt
     """
     Try to load a full velodyne point cloud for this sample by mapping:
       .../velodyne_reduced/XXXXXX.bin -> .../velodyne/XXXXXX.bin
-    If the current info is already velodyne, load that.
-    Returns: (points_xyz, resolved_realpath_str)
     """
     info = _get_data_info(dataset, idx) or {}
     p = resolve_lidar_path_from_info(info)
@@ -252,7 +259,6 @@ def try_load_full_velodyne(dataset, idx: int) -> Tuple[Optional[np.ndarray], Opt
     if "velodyne_reduced" in p_str:
         full_p = Path(p_str.replace("velodyne_reduced", "velodyne"))
     else:
-        # already non-reduced path (or unknown naming)
         full_p = p
 
     if not full_p.exists():
@@ -391,41 +397,23 @@ def corners_to_lineset(corners_8x3: np.ndarray, color_rgb) -> o3d.geometry.LineS
 
 
 # -------------------------
-# Main
+# Scene builder for one dataset index
 # -------------------------
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("cfg", type=str)
-    parser.add_argument("ckpt", type=str)
-    parser.add_argument("--sample-id", required=True, type=str)
-    parser.add_argument("--device", default="cuda:0", type=str)
-    parser.add_argument("--score-thr", default=0.1, type=float)
-
-    parser.add_argument("--point-size", default=2.0, type=float)
-    parser.add_argument("--show", action="store_true")
-    parser.add_argument("--out-dir", default=None, type=str)
-
-    # Optional CLI overrides (leave unset to use the in-code params)
-    parser.add_argument("--points-mode", default=None, type=str, choices=["pipeline", "full", "both"])
-    parser.add_argument("--debug-print", action="store_true")
-    args = parser.parse_args()
-
-    points_mode = args.points_mode if args.points_mode is not None else POINTS_VIS_MODE
-
-    register_all_modules(init_default_scope=True)
-    cfg = Config.fromfile(args.cfg)
-
-    dataset = DATASETS.build(cfg.test_dataloader.dataset)
-    ensure_full_init(dataset)
-
-    idx = find_sample_index(dataset, args.sample_id)
-    sid = norm_sample_id(args.sample_id)
-    print(f"[INFO] Dataset len={len(dataset)} sample-id={sid} dataset_idx={idx}")
-
-    # init model
-    model = init_model(cfg, args.ckpt, device=args.device)
-    model.eval()
+def build_scene_for_idx(
+    dataset,
+    cfg: Config,
+    model,
+    idx: int,
+    score_thr: float,
+    points_mode: str,
+    debug_print: bool,
+) -> Tuple[str, List[o3d.geometry.Geometry], Dict[str, Any]]:
+    """
+    Returns: (sample_id_str, geometries, debug_dict)
+    """
+    info = _get_data_info(dataset, idx) or {}
+    sid = norm_sample_id(info.get("sample_idx", idx)) or f"{idx:06d}"
 
     # pipeline sample + inference
     data = dataset[idx]
@@ -441,74 +429,82 @@ def main():
     # full points (if exist)
     pts_full, full_path_used = try_load_full_velodyne(dataset, idx)
 
-    # Decide which clouds to visualize
+    # choose clouds
     pts_pipeline_vis = None
     pts_full_vis = None
 
     if points_mode in ("pipeline", "both"):
-        pts_pipeline_vis = pts_pipeline.copy()
-        pts_pipeline_vis = cap_points(pts_pipeline_vis, PIPELINE_MAX_POINTS)
+        pts_pipeline_vis = cap_points(pts_pipeline.copy(), PIPELINE_MAX_POINTS)
         pts_pipeline_vis = voxel_downsample_points(pts_pipeline_vis, PIPELINE_VOXEL)
 
     if points_mode in ("full", "both"):
         if pts_full is None:
-            print("[WARN] Could not load full velodyne for this sample (file missing or unreadable).")
+            pts_full_vis = None
         else:
-            pts_full_vis = pts_full.copy()
-            pts_full_vis = cap_points(pts_full_vis, FULL_MAX_POINTS)
+            pts_full_vis = cap_points(pts_full.copy(), FULL_MAX_POINTS)
             pts_full_vis = voxel_downsample_points(pts_full_vis, FULL_VOXEL)
 
     # preds
     pred_corners_all, scores = pred_corners_from_output(pred_sample)
     pred_corners = None
+    kept_pred = 0
+    total_pred = 0
     if pred_corners_all is not None:
+        total_pred = int(pred_corners_all.shape[0])
         if scores is not None:
-            keep = scores >= float(args.score_thr)
+            keep = scores >= float(score_thr)
             pred_corners = pred_corners_all[keep]
-            print(f"[INFO] Pred kept >= {args.score_thr}: {int(keep.sum())}/{pred_corners_all.shape[0]}")
+            kept_pred = int(keep.sum())
         else:
             pred_corners = pred_corners_all
-            print(f"[INFO] Pred (no scores): {pred_corners.shape[0]}")
-    else:
-        print("[WARN] No predicted boxes found.")
+            kept_pred = int(pred_corners.shape[0])
 
     # GT from eval_ann_info (test.py aligned)
     gt_corners = gt_corners_from_eval_ann_info(dataset, idx)
     gt_centers = gt_centers_from_eval_ann_info(dataset, idx)
-    if gt_corners is None:
-        print("[WARN] No GT boxes found in eval_ann_info for this sample.")
-    else:
-        print(f"[INFO] GT boxes from eval_ann_info: {gt_corners.shape[0]}")
 
-    # Optional GT range filter
+    # optional GT range filter
     if GT_RANGE_FILTER and gt_corners is not None and gt_centers is not None:
         pcr = get_voxel_point_cloud_range(cfg)
         if pcr is not None:
-            before = gt_corners.shape[0]
             gt_corners = filter_boxes_by_center_range(gt_corners, gt_centers, pcr)
-            print(f"[INFO] GT range-filtered by voxel point_cloud_range: {gt_corners.shape[0]}/{before}")
-        else:
-            print("[WARN] Could not read cfg.model.voxel_layer.point_cloud_range, skipping GT_RANGE_FILTER.")
 
-    if args.debug_print:
-        info = _get_data_info(dataset, idx) or {}
-        lp = info.get("lidar_points", {})
-        lidar_path = lp.get("lidar_path") or lp.get("pts_path") or info.get("lidar_path")
+    # debug: resolved lidar path
+    lp = info.get("lidar_points", {})
+    lidar_path = None
+    if isinstance(lp, dict):
+        lidar_path = lp.get("lidar_path") or lp.get("pts_path")
+    if lidar_path is None:
+        lidar_path = info.get("lidar_path")
+    lidar_resolved = os.path.realpath(str(lidar_path)) if lidar_path is not None else None
+
+    dbg = {
+        "idx": idx,
+        "sid": sid,
+        "lidar_path": lidar_path,
+        "lidar_resolved": lidar_resolved,
+        "full_velodyne_resolved": full_path_used,
+        "pred_kept": kept_pred,
+        "pred_total": total_pred,
+        "gt_count": int(gt_corners.shape[0]) if gt_corners is not None else 0,
+        "pts_pipeline_n": int(pts_pipeline_vis.shape[0]) if pts_pipeline_vis is not None else 0,
+        "pts_full_n": int(pts_full_vis.shape[0]) if pts_full_vis is not None else 0,
+    }
+
+    if debug_print:
+        print(f"[DEBUG] idx={idx} sid={sid}")
         if lidar_path is not None:
             print("[DEBUG] lidar_path from info:", lidar_path)
-            print("[DEBUG] resolved:", os.path.realpath(str(lidar_path)))
+            print("[DEBUG] resolved:", lidar_resolved)
         if full_path_used is not None:
             print("[DEBUG] full velodyne resolved:", full_path_used)
-
         if pts_pipeline_vis is not None:
             print("[DEBUG] pipeline pts x[min,max]:", float(pts_pipeline_vis[:, 0].min()), float(pts_pipeline_vis[:, 0].max()))
         if pts_full_vis is not None:
             print("[DEBUG] full pts x[min,max]:", float(pts_full_vis[:, 0].min()), float(pts_full_vis[:, 0].max()))
-
         if gt_centers is not None:
             print("[DEBUG] gt centers x[min,max]:", float(gt_centers[:, 0].min()), float(gt_centers[:, 0].max()))
 
-    # Open3D scene
     geometries: List[o3d.geometry.Geometry] = []
     geometries.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0, origin=[0, 0, 0]))
 
@@ -516,7 +512,15 @@ def main():
         pcd = o3d.geometry.PointCloud()
         pcd.points = o3d.utility.Vector3dVector(pts_pipeline_vis.astype(np.float64))
         pcd.paint_uniform_color(PIPELINE_POINTS_COLOR)
-        geometries.append(pcd)
+
+        if PIPELINE_RENDER_AS_VOXELGRID:
+            vg = o3d.geometry.VoxelGrid.create_from_point_cloud(
+                pcd, voxel_size=float(PIPELINE_RENDER_VOXEL_SIZE)
+            )
+            geometries.append(vg)
+        else:
+            geometries.append(pcd)
+
 
     if pts_full_vis is not None:
         pcd2 = o3d.geometry.PointCloud()
@@ -524,58 +528,179 @@ def main():
         pcd2.paint_uniform_color(FULL_POINTS_COLOR)
         geometries.append(pcd2)
 
-    # GT green
     if gt_corners is not None:
         for k in range(gt_corners.shape[0]):
             geometries.append(corners_to_lineset(gt_corners[k], (0.2, 1.0, 0.2)))
 
-    # Pred red
     if pred_corners is not None:
         for k in range(pred_corners.shape[0]):
             geometries.append(corners_to_lineset(pred_corners[k], (1.0, 0.2, 0.2)))
+
+    return sid, geometries, dbg
+
+
+def print_help():
+    print("Keys:")
+    print("  N : next sample (wrap)")
+    print("  B : previous sample (wrap)")
+    print("  S : save screenshot to --out-dir")
+    print("  H : print this help + current status")
+    print("  ESC / close window: exit")
+
+
+# -------------------------
+# Main
+# -------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("cfg", type=str)
+    parser.add_argument("ckpt", type=str)
+    parser.add_argument("--sample-id", required=True, type=str, help="starting sample id (6-digit)")
+    parser.add_argument("--device", default="cuda:0", type=str)
+    parser.add_argument("--score-thr", default=0.1, type=float)
+    parser.add_argument("--point-size", default=2.0, type=float)
+    parser.add_argument("--show", action="store_true")
+    parser.add_argument("--out-dir", default=None, type=str)
+    parser.add_argument("--points-mode", default=None, type=str, choices=["pipeline", "full", "both"])
+    parser.add_argument("--debug-print", action="store_true")
+    args = parser.parse_args()
+
+    points_mode = args.points_mode if args.points_mode is not None else POINTS_VIS_MODE
+
+    register_all_modules(init_default_scope=True)
+    cfg = Config.fromfile(args.cfg)
+
+    dataset = DATASETS.build(cfg.test_dataloader.dataset)
+    ensure_full_init(dataset)
+
+    start_idx = find_sample_index(dataset, args.sample_id)
+    n = len(dataset)
 
     out_dir = Path(args.out_dir) if args.out_dir else None
     if out_dir:
         out_dir.mkdir(parents=True, exist_ok=True)
 
+    model = init_model(cfg, args.ckpt, device=args.device)
+    model.eval()
+
+    print(f"[INFO] Dataset split len={n}. Starting at dataset_idx={start_idx}. points_mode={points_mode}")
     if args.show:
-        vis = o3d.visualization.Visualizer()
-        vis.create_window(window_name=f"Pred vs GT (sample {sid})", width=1600, height=900, visible=True)
+        print_help()
+
+        state = {
+            "idx": start_idx,
+            "n": n,
+            "last_sid": None,
+            "last_dbg": None,
+        }
+
+        vis = o3d.visualization.VisualizerWithKeyCallback()
+        vis.create_window(window_name="Pred vs GT browser", width=1600, height=900, visible=True)
         opt = vis.get_render_option()
         if opt is not None:
             opt.point_size = float(args.point_size)
 
-        for g in geometries:
-            vis.add_geometry(g)
+        def redraw(current_idx: int, save_if_needed: bool = False):
+            current_idx = int(current_idx) % n
+            state["idx"] = current_idx
 
-        if out_dir:
+            sid, geoms, dbg = build_scene_for_idx(
+                dataset=dataset,
+                cfg=cfg,
+                model=model,
+                idx=current_idx,
+                score_thr=float(args.score_thr),
+                points_mode=points_mode,
+                debug_print=bool(args.debug_print),
+            )
+
+            state["last_sid"] = sid
+            state["last_dbg"] = dbg
+
+            vis.clear_geometries()
+            for g in geoms:
+                vis.add_geometry(g)
+
             vis.poll_events()
             vis.update_renderer()
-            png = out_dir / f"{sid}_pred_gt.png"
-            vis.capture_screen_image(str(png), do_render=True)
-            print(f"[INFO] Wrote screenshot: {png}")
 
-        print("[INFO] Close the Open3D window to exit.")
+            print(f"[INFO] idx={current_idx}/{n-1} sid={sid} | GT={dbg['gt_count']} | Pred kept={dbg['pred_kept']}/{dbg['pred_total']} | pts(pipeline)={dbg['pts_pipeline_n']} pts(full)={dbg['pts_full_n']}")
+
+            if out_dir and save_if_needed:
+                png = out_dir / f"{sid}_pred_gt.png"
+                vis.capture_screen_image(str(png), do_render=True)
+                print(f"[INFO] Wrote screenshot: {png}")
+
+        def cb_next(v):
+            redraw(state["idx"] + 1, save_if_needed=AUTO_SAVE_ON_NAV)
+            return False
+
+        def cb_prev(v):
+            redraw(state["idx"] - 1, save_if_needed=AUTO_SAVE_ON_NAV)
+            return False
+
+        def cb_save(v):
+            if not out_dir:
+                print("[WARN] No --out-dir set; cannot save screenshot.")
+                return False
+            sid = state["last_sid"] or f"{state['idx']:06d}"
+            png = out_dir / f"{sid}_pred_gt.png"
+            v.capture_screen_image(str(png), do_render=True)
+            print(f"[INFO] Wrote screenshot: {png}")
+            return False
+
+        def cb_help(v):
+            print_help()
+            dbg = state.get("last_dbg", None)
+            if isinstance(dbg, dict):
+                print(f"[INFO] current idx={dbg['idx']} sid={dbg['sid']}")
+                if dbg.get("lidar_resolved") is not None:
+                    print(f"[INFO] lidar_resolved: {dbg['lidar_resolved']}")
+                if dbg.get("full_velodyne_resolved") is not None:
+                    print(f"[INFO] full_velodyne_resolved: {dbg['full_velodyne_resolved']}")
+            return False
+
+        vis.register_key_callback(ord("N"), cb_next)
+        vis.register_key_callback(ord("B"), cb_prev)
+        vis.register_key_callback(ord("S"), cb_save)
+        vis.register_key_callback(ord("H"), cb_help)
+
+        redraw(start_idx, save_if_needed=bool(out_dir))  # keep your old behavior: save first frame if out-dir set
         vis.run()
         vis.destroy_window()
-    else:
-        if not out_dir:
-            raise ValueError("If --show is off, provide --out-dir to save an image.")
-        vis = o3d.visualization.Visualizer()
-        vis.create_window(window_name="offscreen", width=1600, height=900, visible=False)
-        opt = vis.get_render_option()
-        if opt is not None:
-            opt.point_size = float(args.point_size)
+        return
 
-        for g in geometries:
-            vis.add_geometry(g)
+    # Non-interactive mode: keep old behavior (render once offscreen-ish to file)
+    if not out_dir:
+        raise ValueError("If --show is off, you must provide --out-dir to save an image.")
 
-        vis.poll_events()
-        vis.update_renderer()
-        png = out_dir / f"{sid}_pred_gt.png"
-        vis.capture_screen_image(str(png), do_render=True)
-        vis.destroy_window()
-        print(f"[INFO] Wrote screenshot: {png}")
+    # Build one scene and write
+    sid, geoms, dbg = build_scene_for_idx(
+        dataset=dataset,
+        cfg=cfg,
+        model=model,
+        idx=start_idx,
+        score_thr=float(args.score_thr),
+        points_mode=points_mode,
+        debug_print=bool(args.debug_print),
+    )
+
+    vis = o3d.visualization.Visualizer()
+    vis.create_window(window_name="offscreen", width=1600, height=900, visible=False)
+    opt = vis.get_render_option()
+    if opt is not None:
+        opt.point_size = float(args.point_size)
+
+    for g in geoms:
+        vis.add_geometry(g)
+
+    vis.poll_events()
+    vis.update_renderer()
+    png = out_dir / f"{sid}_pred_gt.png"
+    vis.capture_screen_image(str(png), do_render=True)
+    vis.destroy_window()
+    print(f"[INFO] Wrote screenshot: {png}")
 
 
 if __name__ == "__main__":
