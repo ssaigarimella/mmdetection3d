@@ -5,20 +5,26 @@ tools/eval_lidar_ap_from_dump.py
 Compute BEV + 3D AP11/AP40 in pure LiDAR frame.
 No transforms, no calib, no KITTI camera conversion.
 
-Requires mmcv.ops.box_iou_rotated.
+Also writes the printed metrics to a .txt file.
 
-IMPORTANT:
-- This evaluates the boxes stored in the dump.
-- If you used the updated dump_pred_gt_lidar.py, those GT/preds are already filtered
-  to only those within the reduced/pipeline LiDAR FOV (pure angular test).
-
-Usage:
-  python3 tools/eval_lidar_ap_from_dump.py dump.pkl
+Output txt naming is inferred from the dump path:
+- contains "late_fusion" / "lidar_late_fusion" -> late_fusion
+- else contains "infra" / "infrastructure"    -> infra
+- else contains "vehicle"                      -> vehicle
+- else -> unknown
 """
 
 import argparse
 import pickle
+from pathlib import Path
+from datetime import datetime
 import numpy as np
+
+# ==========================================================
+# IN-CODE PARAM: where to save metrics txt files
+# ==========================================================
+METRICS_DIR = Path("/home/dellg16ssg/mmdetection3d/tools/metrics")
+# ==========================================================
 
 
 def ap_from_pr(rec, prec, npoints: int) -> float:
@@ -95,7 +101,6 @@ def iou3d_from_bev_and_height(a7: np.ndarray, b7: np.ndarray, bev_iou: np.ndarra
 
 
 def match_class(samples, cls_id: int, iou_thr: float, use_3d: bool, device: str):
-    # collect all preds globally, sorted by score desc
     preds = []
     gts = []
     total_gt = 0
@@ -162,8 +167,20 @@ def match_class(samples, cls_id: int, iou_thr: float, use_3d: bool, device: str)
     return rec, prec
 
 
+def infer_run_tag_from_path(dump_path: Path) -> str:
+    s = dump_path.as_posix().lower()
+    if "late_fusion" in s or "late-fusion" in s or "lidar_late_fusion" in s:
+        return "late_fusion"
+    if "/infra" in s or "_infra" in s or "infrastructure" in s:
+        return "infra"
+    if "/vehicle" in s or "_vehicle" in s:
+        return "vehicle"
+    return "unknown"
+
+
 def eval_set(name: str, classes, samples, thr_map, device: str):
     print(f"\n=== {name} ===")
+    lines = [f"=== {name} ==="]
     for cls_name in classes:
         cls_id = classes.index(cls_name)
         thr = float(thr_map[cls_name])
@@ -172,7 +189,9 @@ def eval_set(name: str, classes, samples, thr_map, device: str):
         rec_3d, prec_3d = match_class(samples, cls_id, thr, use_3d=True, device=device)
 
         if rec_bev is None:
-            print(f"{cls_name}: no GT")
+            msg = f"{cls_name}: no GT"
+            print(msg)
+            lines.append(msg)
             continue
 
         bev_ap11 = 100.0 * ap_from_pr(rec_bev, prec_bev, 11)
@@ -180,11 +199,14 @@ def eval_set(name: str, classes, samples, thr_map, device: str):
         d3_ap11 = 100.0 * ap_from_pr(rec_3d, prec_3d, 11)
         d3_ap40 = 100.0 * ap_from_pr(rec_3d, prec_3d, 40)
 
-        print(
+        msg = (
             f"{cls_name} IoU={thr:.2f} | "
             f"BEV AP11={bev_ap11:.4f} AP40={bev_ap40:.4f} | "
             f"3D AP11={d3_ap11:.4f} AP40={d3_ap40:.4f}"
         )
+        print(msg)
+        lines.append(msg)
+    return lines
 
 
 def main():
@@ -193,30 +215,47 @@ def main():
     ap.add_argument("--device", type=str, default="cuda:0", help="Device for rotated IoU (mmcv op).")
     args = ap.parse_args()
 
-    dump = pickle.load(open(args.dump_pkl, "rb"))
+    dump_path = Path(args.dump_pkl)
+    dump = pickle.load(open(dump_path, "rb"))
     classes = list(dump["classes"])
     samples = dump["samples"]
 
-    # Print FOV filter settings if present (sanity)
+    run_tag = infer_run_tag_from_path(dump_path)
+
+    header = []
+    def h(msg):
+        print(msg)
+        header.append(msg)
+
+    h(f"[INFO] dump_pkl: {dump_path}")
+    h(f"[INFO] run_tag: {run_tag}")
+    h(f"[INFO] timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    h(f"[INFO] num_samples: {len(samples)}")
+    h(f"[INFO] classes: {classes}")
+
     fcfg = dump.get("fov_filter", None)
     if isinstance(fcfg, dict):
-        print("[INFO] Dump contains FOV filter settings:")
+        h("[INFO] Dump contains FOV filter settings:")
         for k in sorted(fcfg.keys()):
-            print(f"  - {k}: {fcfg[k]}")
+            h(f"  - {k}: {fcfg[k]}")
 
-    # KITTI-like strict/loose thresholds (same style as MMDet3D logs)
     thr_strict = {"Pedestrian": 0.50, "Cyclist": 0.50, "Car": 0.70}
     thr_loose  = {"Pedestrian": 0.25, "Cyclist": 0.25, "Car": 0.50}
-
-    # If your classes list differs, default to 0.5 / 0.25
     for c in classes:
         if c not in thr_strict:
             thr_strict[c] = 0.50
         if c not in thr_loose:
             thr_loose[c] = 0.25
 
-    eval_set("STRICT", classes, samples, thr_strict, device=args.device)
-    eval_set("LOOSE", classes, samples, thr_loose, device=args.device)
+    strict_lines = eval_set("STRICT", classes, samples, thr_strict, device=args.device)
+    loose_lines = eval_set("LOOSE", classes, samples, thr_loose, device=args.device)
+
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    dump_stem = dump_path.with_suffix("").name
+    out_txt = METRICS_DIR / f"{dump_stem}_eval_{run_tag}.txt"
+
+    out_txt.write_text("\n".join(header + [""] + strict_lines + [""] + loose_lines) + "\n")
+    print(f"\n[INFO] Wrote metrics txt: {out_txt}")
 
 
 if __name__ == "__main__":
