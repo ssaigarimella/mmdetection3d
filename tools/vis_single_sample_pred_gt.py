@@ -64,7 +64,7 @@ from mmdet3d.utils import register_all_modules
 # "pipeline" = what the model sees (likely velodyne_reduced in your setup)
 # "full"     = load velodyne/*.bin if present (no reduced/frustum clipping)
 # "both"     = overlay both clouds
-POINTS_VIS_MODE = "both"   # "pipeline" | "full" | "both"
+POINTS_VIS_MODE = "pipeline"   # "pipeline" | "full" | "both"
 
 # Downsample settings for each cloud (separately)
 PIPELINE_MAX_POINTS = 200000

@@ -8,31 +8,22 @@ Open3D visual checker for DAIR-V2X-style LiDAR late fusion baseline:
 
 Point clouds (all in vehicle frame):
   - vehicle FULL velodyne (optional)
-  - vehicle REDUCED velodyne_reduced (pipeline points; always available)
+  - vehicle REDUCED velodyne_reduced (pipeline points; always available)  -> rendered as COLORED CUBES (VoxelGrid)
   - infra FULL velodyne transformed into vehicle frame (optional)
-  - infra REDUCED velodyne_reduced transformed into vehicle frame (pipeline points; always available)
+  - infra REDUCED velodyne_reduced transformed into vehicle frame (pipeline points; always available) -> rendered as COLORED CUBES (VoxelGrid)
 
 Boxes (all in vehicle frame):
   - vehicle GT boxes (filtered by vehicle reduced-LiDAR FOV)
   - infra GT boxes transformed into vehicle frame (filtered by infra reduced-LiDAR FOV)
   - vehicle preds (filtered by vehicle reduced-LiDAR FOV)
   - infra preds transformed into vehicle frame (filtered by infra reduced-LiDAR FOV)
-  - fused preds after Hungarian matching (Euclidean distance), optionally filtered by vehicle reduced-LiDAR FOV
+  - fused preds after Hungarian matching, optionally filtered by vehicle reduced-LiDAR FOV
 
-Transform source of truth:
-- Uses NON_KITTI_ROOT JSONs exactly like tools/v2x_vis_open3d_sanity.py:
-    vehicle: novatel_to_world, lidar_to_novatel
-    infra:   virtuallidar_to_world
-Then:
-    T_world_from_veh_lidar = T_world_from_veh_novatel @ T_veh_novatel_from_veh_lidar
-    T_veh_from_inf         = inv(T_world_from_veh_lidar) @ T_world_from_inf_lidar
-
-Keys:
-  N : next sample (wrap)
-  B : previous sample (wrap)
-  S : save screenshot to --out-dir
-  H : help + status + legend
-  ESC / close window: exit
+IMPORTANT FIX:
+- The old version filtered GT by CENTER angles only, with a loose FOV estimate.
+- This version matches tools/vis_single_sample_pred_gt.py semantics:
+    * infer reduced-LiDAR FOV envelope from PIPELINE points (az, el, range)
+    * keep a box if ANY corner is inside that envelope.
 """
 
 import argparse
@@ -60,47 +51,74 @@ from mmdet3d.utils import register_all_modules
 # VIS SETTINGS (defaults)
 # ============================================================
 
-# Reduced points come from the pipeline points (typically velodyne_reduced) and are always available.
 PIPELINE_MAX_POINTS_REDUCED = 250000
 PIPELINE_VOXEL_REDUCED = 0.05
 
-# Full points are loaded from velodyne/<id>.bin by path rewrite when possible.
 PIPELINE_MAX_POINTS_FULL = 250000
 PIPELINE_VOXEL_FULL = 0.08
 
-# Colors
-VEH_FULL_POINTS_COLOR      = (0.35, 0.35, 0.35)  # darker gray
-VEH_REDUCED_POINTS_COLOR   = (0.75, 0.75, 0.75)  # gray
+VEH_FULL_POINTS_COLOR      = (0.20, 0.20, 0.20)  # dark gray
+INF_FULL_POINTS_COLOR      = (0.05, 0.20, 0.60)  # dark blue
 
-INF_FULL_POINTS_COLOR      = (0.10, 0.30, 0.70)  # darker blue
-INF_REDUCED_POINTS_COLOR   = (0.20, 0.55, 1.00)  # blue
+VEH_REDUCED_POINTS_COLOR   = (0.00, 1.00, 1.00)  # bright cyan
+INF_REDUCED_POINTS_COLOR   = (1.00, 1.00, 0.00)  # bright yellow
 
 GT_VEH_COLOR               = (0.20, 1.00, 0.20)  # green
-GT_INF_COLOR               = (1.00, 0.85, 0.20)  # yellow
+GT_INF_COLOR               = (1.00, 0.55, 0.10)  # amber/orange
 
 PRED_VEH_COLOR             = (1.00, 0.20, 0.20)  # red
 PRED_INF_COLOR             = (1.00, 0.10, 0.80)  # magenta
 PRED_FUSED_COLOR           = (1.00, 0.65, 0.05)  # orange
 
-# Rendering style
-VEH_REDUCED_RENDER_AS_VOXELGRID = True
+RENDER_VEH_REDUCED_AS_VOXELGRID = True
+RENDER_INF_REDUCED_AS_VOXELGRID = True
+
 VEH_REDUCED_VOXELGRID_SIZE = 0.20
+INF_REDUCED_VOXELGRID_SIZE = 0.20
+
+RENDER_VEH_FULL_AS_VOXELGRID = False
+RENDER_INF_FULL_AS_VOXELGRID = False
+VEH_FULL_VOXELGRID_SIZE = 0.12
+INF_FULL_VOXELGRID_SIZE = 0.12
+
 
 # ============================================================
-# FOV SETTINGS (reduced LiDAR)
+# FOV SETTINGS (reduced LiDAR)  [FIXED TO MATCH vis_single_sample_pred_gt.py]
 # ============================================================
 
-USE_PERCENTILES = True
-AZIMUTH_PCTS = (0.5, 99.5)
-ELEVATION_PCTS = (0.5, 99.5)
-AZ_MARGIN_DEG = 0.25
-EL_MARGIN_DEG = 0.25
+# Use pipeline points to infer FOV envelope, then keep a box if ANY corner is inside.
+# These are intentionally similar to tools/vis_single_sample_pred_gt.py.
+
+FOV_SUBSAMPLE_MAX_POINTS = 120000
+
+# fraction of points whose azimuth should be covered by the inferred interval (tighten if needed)
+FOV_AZ_COVERAGE = 0.999
+
+# elevation/range robust percentiles
+FOV_EL_LOW_PCT  = 0.001
+FOV_EL_HIGH_PCT = 0.999
+FOV_R_LOW_PCT   = 0.001
+FOV_R_HIGH_PCT  = 0.999
+
+# margins to avoid over-pruning
+FOV_AZ_MARGIN_DEG = 1.0
+FOV_EL_MARGIN_DEG = 1.0
+FOV_R_MARGIN_M    = 0.5
+
+# If True, require the corner to be in front of sensor (x>0) to count as "inside".
+# For 360 lidars you usually want False.
+FOV_REQUIRE_X_POSITIVE = False
+
 MIN_PTS_FOR_FOV = 64
 
 FILTER_GT_BY_FOV = True
 FILTER_PRED_BY_FOV = True
 FILTER_FUSED_BY_VEH_FOV = True
-BOX_TEST = "center"  # center-angle test only
+
+# Optional extra: after transforming infra GT/preds into vehicle frame, also filter them
+# by VEHICLE reduced FOV (common evaluation/view expectation in vehicle frame).
+FILTER_INF_IN_VEH_FRAME_BY_VEH_FOV = False
+
 
 # ============================================================
 # LATE FUSION SETTINGS
@@ -117,14 +135,17 @@ FUSE_POLICY = "pick_best"  # when matched, pick the higher-score box
 def print_legend() -> None:
     print("[LEGEND]")
     print("  Vehicle FULL points ............ VEH_FULL_POINTS_COLOR (dark gray)")
-    print("  Vehicle REDUCED points ......... VEH_REDUCED_POINTS_COLOR (gray)  [pipeline points]")
+    print("  Vehicle REDUCED cubes .......... VEH_REDUCED_POINTS_COLOR (bright cyan)  [pipeline points]")
     print("  Infra FULL points -> veh ....... INF_FULL_POINTS_COLOR (dark blue)")
-    print("  Infra REDUCED points -> veh .... INF_REDUCED_POINTS_COLOR (blue)  [pipeline points]")
+    print("  Infra REDUCED cubes -> veh ..... INF_REDUCED_POINTS_COLOR (bright yellow) [pipeline points]")
     print("  Vehicle GT boxes ............... GT_VEH_COLOR (green)")
-    print("  Infra GT boxes -> veh .......... GT_INF_COLOR (yellow)")
+    print("  Infra GT boxes -> veh .......... GT_INF_COLOR (amber)")
     print("  Vehicle predictions ............ PRED_VEH_COLOR (red)")
     print("  Infra predictions -> veh ....... PRED_INF_COLOR (magenta)")
     print("  Fused predictions .............. PRED_FUSED_COLOR (orange)")
+    print("[CUBE SIZES]")
+    print(f"  VEH_REDUCED_VOXELGRID_SIZE={VEH_REDUCED_VOXELGRID_SIZE}")
+    print(f"  INF_REDUCED_VOXELGRID_SIZE={INF_REDUCED_VOXELGRID_SIZE}")
 
 
 # -------------------------
@@ -198,7 +219,6 @@ def extract_points_from_batch(data_batch: Dict) -> np.ndarray:
 def resolve_existing_path(p: Path) -> Optional[Path]:
     if p.is_file():
         return p
-    # common case: path is relative to repo root
     q = Path.cwd() / p
     if q.is_file():
         return q
@@ -219,17 +239,12 @@ def guess_full_from_reduced_path(reduced_path: Path) -> Optional[Path]:
     rp = Path(str(reduced_path))
     s = rp.as_posix()
 
-    # Most typical:
-    #   .../velodyne_reduced/000002.bin  -> .../velodyne/000002.bin
     if "velodyne_reduced" in s:
         fp = Path(s.replace("velodyne_reduced", "velodyne"))
-        fp2 = resolve_existing_path(fp)
-        return fp2
+        return resolve_existing_path(fp)
 
-    # If it's already velodyne, treat as full
     if "/velodyne/" in s:
-        fp2 = resolve_existing_path(rp)
-        return fp2
+        return resolve_existing_path(rp)
 
     return None
 
@@ -245,6 +260,18 @@ def info_lidar_path(info: Dict) -> Optional[Path]:
     if p:
         return Path(str(p))
     return None
+
+
+def make_pcd(pts: np.ndarray, color_rgb) -> o3d.geometry.PointCloud:
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
+    pcd.paint_uniform_color(color_rgb)
+    return pcd
+
+def make_voxelgrid_from_points(pts: np.ndarray, color_rgb, voxel_size: float) -> o3d.geometry.VoxelGrid:
+    pcd = make_pcd(pts, color_rgb)
+    vg = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=float(voxel_size))
+    return vg
 
 
 # -------------------------
@@ -383,61 +410,155 @@ def gt_from_eval_ann_info(dataset, idx: int) -> Tuple[np.ndarray, np.ndarray, np
     return corners, centers, labels
 
 
-# -------------------------
-# FOV from reduced points (center-angle based)
-# -------------------------
+# ============================================================
+# FOV envelope from pipeline points (az, el, range) + corner-based box filter
+# ============================================================
 
-def _angles_from_xyz(xyz: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    x = xyz[:, 0]
-    y = xyz[:, 1]
-    z = xyz[:, 2]
-    az = np.degrees(np.arctan2(y, x))
-    r = np.sqrt(x * x + y * y) + 1e-12
-    el = np.degrees(np.arctan2(z, r))
-    return az, el
+def _subsample_rows(x: np.ndarray, max_rows: int) -> np.ndarray:
+    if max_rows is None or max_rows <= 0 or x.shape[0] <= max_rows:
+        return x
+    sel = np.random.choice(x.shape[0], size=max_rows, replace=False)
+    return x[sel]
 
-def _norm_angle_deg(a: float) -> float:
-    x = (a + 180.0) % 360.0 - 180.0
-    return 180.0 if x == -180.0 else x
+def _minimal_circular_interval_covering(angles_rad: np.ndarray, coverage: float) -> Tuple[float, float]:
+    """
+    Smallest circular interval [lo, hi] on [0, 2pi) that contains >= coverage fraction of angles.
+    Returns (lo, hi) in [0,2pi). The interval may wrap (lo > hi).
+    """
+    a = np.mod(angles_rad, 2.0 * np.pi)
+    a = np.sort(a)
+    n = a.size
+    if n == 0:
+        return 0.0, 0.0
 
-def _angle_in_range(a: float, lo: float, hi: float) -> bool:
-    a = _norm_angle_deg(a)
-    lo = _norm_angle_deg(lo)
-    hi = _norm_angle_deg(hi)
+    k = int(np.ceil(float(coverage) * n))
+    k = max(1, min(k, n))
+
+    a2 = np.concatenate([a, a + 2.0 * np.pi])
+
+    best_len = 1e18
+    best_lo = a[0]
+    best_hi = a[0]
+
+    for i in range(n):
+        j = i + k - 1
+        lo = a2[i]
+        hi = a2[j]
+        span = hi - lo
+        if span < best_len:
+            best_len = span
+            best_lo = lo
+            best_hi = hi
+
+    lo = float(np.mod(best_lo, 2.0 * np.pi))
+    hi = float(np.mod(best_hi, 2.0 * np.pi))
+    return lo, hi
+
+def _angle_in_interval(ang: np.ndarray, lo: float, hi: float) -> np.ndarray:
+    """
+    ang, lo, hi in [0,2pi).
+    If lo<=hi: lo<=ang<=hi
+    If lo>hi (wrap): ang>=lo OR ang<=hi
+    """
+    ang = np.mod(ang, 2.0 * np.pi)
+    lo = float(np.mod(lo, 2.0 * np.pi))
+    hi = float(np.mod(hi, 2.0 * np.pi))
     if lo <= hi:
-        return (a >= lo) and (a <= hi)
-    return (a >= lo) or (a <= hi)
-
-def estimate_fov_from_points(pts_xyz: np.ndarray) -> Dict[str, float]:
-    if pts_xyz is None or pts_xyz.shape[0] < MIN_PTS_FOR_FOV:
-        return {"az_lo": -180.0, "az_hi": 180.0, "el_lo": -90.0, "el_hi": 90.0}
-
-    az, el = _angles_from_xyz(pts_xyz)
-    if USE_PERCENTILES:
-        az_lo, az_hi = np.percentile(az, AZIMUTH_PCTS).tolist()
-        el_lo, el_hi = np.percentile(el, ELEVATION_PCTS).tolist()
+        return (ang >= lo) & (ang <= hi)
     else:
-        az_lo, az_hi = float(az.min()), float(az.max())
-        el_lo, el_hi = float(el.min()), float(el.max())
+        return (ang >= lo) | (ang <= hi)
 
-    az_lo = float(az_lo) - float(AZ_MARGIN_DEG)
-    az_hi = float(az_hi) + float(AZ_MARGIN_DEG)
-    el_lo = float(el_lo) - float(EL_MARGIN_DEG)
-    el_hi = float(el_hi) + float(EL_MARGIN_DEG)
+def compute_pipeline_fov(pts_xyz: np.ndarray) -> Dict[str, float]:
+    """
+    Infer reduced LiDAR envelope from PIPELINE points:
+      az in a minimal circular interval covering FOV_AZ_COVERAGE fraction
+      el in [pct_lo, pct_hi]
+      r  in [pct_lo, pct_hi]
+    Angles stored in radians.
+    """
+    if pts_xyz is None or pts_xyz.shape[0] < MIN_PTS_FOR_FOV:
+        # very permissive fallback
+        return {
+            "az_lo": 0.0, "az_hi": 0.0,
+            "el_lo": -0.5*np.pi, "el_hi": 0.5*np.pi,
+            "r_lo": 0.0, "r_hi": 1e9,
+        }
 
-    el_lo = max(el_lo, -89.9)
-    el_hi = min(el_hi, 89.9)
-    return {"az_lo": az_lo, "az_hi": az_hi, "el_lo": el_lo, "el_hi": el_hi}
+    p = _subsample_rows(pts_xyz, FOV_SUBSAMPLE_MAX_POINTS)
 
-def filter_centers_by_fov(centers: np.ndarray, fov: Dict[str, float]) -> np.ndarray:
-    if centers is None or centers.shape[0] == 0:
-        return np.zeros((0,), dtype=bool)
-    az, el = _angles_from_xyz(centers)
-    keep = np.zeros((centers.shape[0],), dtype=bool)
-    for i in range(centers.shape[0]):
-        if _angle_in_range(float(az[i]), fov["az_lo"], fov["az_hi"]) and (float(el[i]) >= fov["el_lo"]) and (float(el[i]) <= fov["el_hi"]):
-            keep[i] = True
-    return keep
+    x = p[:, 0]
+    y = p[:, 1]
+    z = p[:, 2]
+
+    r = np.sqrt(x * x + y * y + z * z) + 1e-9
+    az = np.arctan2(y, x)  # [-pi, pi]
+    el = np.arcsin(np.clip(z / r, -1.0, 1.0))  # [-pi/2, pi/2]
+
+    az_lo, az_hi = _minimal_circular_interval_covering(az, coverage=FOV_AZ_COVERAGE)
+    el_lo = float(np.quantile(el, FOV_EL_LOW_PCT))
+    el_hi = float(np.quantile(el, FOV_EL_HIGH_PCT))
+    r_lo  = float(np.quantile(r,  FOV_R_LOW_PCT))
+    r_hi  = float(np.quantile(r,  FOV_R_HIGH_PCT))
+
+    return {"az_lo": az_lo, "az_hi": az_hi, "el_lo": el_lo, "el_hi": el_hi, "r_lo": r_lo, "r_hi": r_hi}
+
+def filter_boxes_by_pipeline_fov(
+    corners: np.ndarray,
+    centers: np.ndarray,
+    labels: np.ndarray,
+    pts_pipeline_xyz: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, float], np.ndarray]:
+    """
+    Keep boxes where ANY corner lies within (az, el, r) envelope inferred from pts_pipeline_xyz,
+    with margins. Returns filtered (corners, centers, labels, fov_dbg, keep_mask).
+    """
+    if corners is None or corners.shape[0] == 0:
+        return corners, centers, labels, {}, np.zeros((0,), dtype=bool)
+    if pts_pipeline_xyz is None or pts_pipeline_xyz.shape[0] < MIN_PTS_FOR_FOV:
+        keep = np.ones((corners.shape[0],), dtype=bool)
+        return corners, centers, labels, {"note": "FOV fallback (too few points)"}, keep
+
+    fov = compute_pipeline_fov(pts_pipeline_xyz)
+
+    az_margin = np.deg2rad(float(FOV_AZ_MARGIN_DEG))
+    el_margin = np.deg2rad(float(FOV_EL_MARGIN_DEG))
+
+    az_lo = float(np.mod(fov["az_lo"] - az_margin, 2.0 * np.pi))
+    az_hi = float(np.mod(fov["az_hi"] + az_margin, 2.0 * np.pi))
+    el_lo = float(fov["el_lo"] - el_margin)
+    el_hi = float(fov["el_hi"] + el_margin)
+    r_lo  = float(max(0.0, fov["r_lo"] - float(FOV_R_MARGIN_M)))
+    r_hi  = float(fov["r_hi"] + float(FOV_R_MARGIN_M))
+
+    c = np.asarray(corners, dtype=np.float64)  # (N,8,3)
+    x = c[:, :, 0]
+    y = c[:, :, 1]
+    z = c[:, :, 2]
+    r = np.sqrt(x * x + y * y + z * z) + 1e-9
+    az = np.mod(np.arctan2(y, x), 2.0 * np.pi)
+    el = np.arcsin(np.clip(z / r, -1.0, 1.0))
+
+    in_az = _angle_in_interval(az, az_lo, az_hi)
+    in_el = (el >= el_lo) & (el <= el_hi)
+    in_r  = (r  >= r_lo)  & (r  <= r_hi)
+
+    in_all = in_az & in_el & in_r
+    if FOV_REQUIRE_X_POSITIVE:
+        in_all = in_all & (x > 0.0)
+
+    keep = np.any(in_all, axis=1)
+
+    fov_dbg = {
+        "az_lo_deg": float(np.rad2deg(az_lo)),
+        "az_hi_deg": float(np.rad2deg(az_hi)),
+        "el_lo_deg": float(np.rad2deg(el_lo)),
+        "el_hi_deg": float(np.rad2deg(el_hi)),
+        "r_lo_m": float(r_lo),
+        "r_hi_m": float(r_hi),
+        "az_coverage": float(FOV_AZ_COVERAGE),
+    }
+
+    return corners[keep], centers[keep], labels[keep], fov_dbg, keep
 
 
 # -------------------------
@@ -736,12 +857,6 @@ def corners_to_lineset(corners_8x3: np.ndarray, color_rgb) -> o3d.geometry.LineS
     )
     return ls
 
-def make_pcd(pts: np.ndarray, color_rgb) -> o3d.geometry.PointCloud:
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(pts.astype(np.float64))
-    pcd.paint_uniform_color(color_rgb)
-    return pcd
-
 
 # -------------------------
 # One-side inference wrapper
@@ -758,9 +873,8 @@ def run_one_side(dataset, model, idx: int, score_thr: float, want_full_points: b
         outputs = model.test_step(data_batch)
     pred_sample = outputs[0]
 
-    # Reduced points: whatever the pipeline gives us (typically velodyne_reduced)
+    # Reduced points: pipeline points (what model sees)
     pts_reduced_pipeline = extract_points_from_batch(data_batch)
-    fov = estimate_fov_from_points(pts_reduced_pipeline)
 
     pts_reduced_vis = cap_points(pts_reduced_pipeline.copy(), PIPELINE_MAX_POINTS_REDUCED)
     pts_reduced_vis = voxel_downsample_points(pts_reduced_vis, PIPELINE_VOXEL_REDUCED)
@@ -782,22 +896,46 @@ def run_one_side(dataset, model, idx: int, score_thr: float, want_full_points: b
                 pts_full_vis = None
                 full_path_used = None
 
-    # GT
+    # GT (test.py aligned)
     gt_corners, gt_centers, gt_labels = gt_from_eval_ann_info(dataset, idx)
-    if FILTER_GT_BY_FOV and gt_centers.shape[0] > 0:
-        keep_gt = filter_centers_by_fov(gt_centers, fov)
-        gt_corners = gt_corners[keep_gt]
-        gt_centers = gt_centers[keep_gt]
-        gt_labels = gt_labels[keep_gt]
 
     # Preds
     pred_corners, pred_centers, pred_scores, pred_labels = pred_from_output(pred_sample, score_thr=score_thr)
-    if FILTER_PRED_BY_FOV and pred_centers.shape[0] > 0:
-        keep_pr = filter_centers_by_fov(pred_centers, fov)
-        pred_corners = pred_corners[keep_pr]
-        pred_centers = pred_centers[keep_pr]
-        pred_scores = pred_scores[keep_pr]
-        pred_labels = pred_labels[keep_pr]
+
+    # FOV envelope inferred from pipeline points (store debug)
+    fov_dbg = compute_pipeline_fov(pts_reduced_pipeline)
+    fov_dbg_printable = {
+        "az_lo_deg": float(np.rad2deg(fov_dbg["az_lo"])),
+        "az_hi_deg": float(np.rad2deg(fov_dbg["az_hi"])),
+        "el_lo_deg": float(np.rad2deg(fov_dbg["el_lo"])),
+        "el_hi_deg": float(np.rad2deg(fov_dbg["el_hi"])),
+        "r_lo_m": float(fov_dbg["r_lo"]),
+        "r_hi_m": float(fov_dbg["r_hi"]),
+        "az_coverage": float(FOV_AZ_COVERAGE),
+    }
+
+    # FIX: Filter GT by CORNERS inside pipeline FOV envelope (not center-angle)
+    if FILTER_GT_BY_FOV and gt_corners.shape[0] > 0:
+        gt_corners, gt_centers, gt_labels, fov_dbg2, _ = filter_boxes_by_pipeline_fov(
+            corners=gt_corners,
+            centers=gt_centers,
+            labels=gt_labels,
+            pts_pipeline_xyz=pts_reduced_pipeline,
+        )
+        # prefer the post-margin debug
+        if isinstance(fov_dbg2, dict) and len(fov_dbg2) > 0:
+            fov_dbg_printable = fov_dbg2
+
+    # Filter PRED by CORNERS inside pipeline FOV envelope (consistent with GT)
+    if FILTER_PRED_BY_FOV and pred_corners.shape[0] > 0:
+        pred_corners2, pred_centers2, pred_labels2, _, keep_pred = filter_boxes_by_pipeline_fov(
+            corners=pred_corners,
+            centers=pred_centers,
+            labels=pred_labels,
+            pts_pipeline_xyz=pts_reduced_pipeline,
+        )
+        pred_scores = pred_scores[keep_pred]
+        pred_corners, pred_centers, pred_labels = pred_corners2, pred_centers2, pred_labels2
 
     return {
         "info": info,
@@ -806,7 +944,7 @@ def run_one_side(dataset, model, idx: int, score_thr: float, want_full_points: b
         "pts_reduced_pipeline": pts_reduced_pipeline,
         "pts_reduced_vis": pts_reduced_vis,
         "pts_full_vis": pts_full_vis,
-        "fov": fov,
+        "fov_dbg": fov_dbg_printable,
         "gt_corners": gt_corners,
         "gt_centers": gt_centers,
         "gt_labels": gt_labels,
@@ -865,30 +1003,48 @@ def build_scene_for_sid(
 
     # Vehicle clouds (already in vehicle frame)
     if show_veh_full and out_v["pts_full_vis"] is not None and out_v["pts_full_vis"].shape[0] > 0:
-        geoms.append(make_pcd(out_v["pts_full_vis"], VEH_FULL_POINTS_COLOR))
+        if RENDER_VEH_FULL_AS_VOXELGRID:
+            geoms.append(make_voxelgrid_from_points(out_v["pts_full_vis"], VEH_FULL_POINTS_COLOR, VEH_FULL_VOXELGRID_SIZE))
+        else:
+            geoms.append(make_pcd(out_v["pts_full_vis"], VEH_FULL_POINTS_COLOR))
 
     if show_veh_reduced and out_v["pts_reduced_vis"] is not None and out_v["pts_reduced_vis"].shape[0] > 0:
-        pcd_vr = make_pcd(out_v["pts_reduced_vis"], VEH_REDUCED_POINTS_COLOR)
-        if VEH_REDUCED_RENDER_AS_VOXELGRID:
-            vg = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd_vr, voxel_size=float(VEH_REDUCED_VOXELGRID_SIZE))
-            geoms.append(vg)
+        if RENDER_VEH_REDUCED_AS_VOXELGRID:
+            geoms.append(make_voxelgrid_from_points(out_v["pts_reduced_vis"], VEH_REDUCED_POINTS_COLOR, VEH_REDUCED_VOXELGRID_SIZE))
         else:
-            geoms.append(pcd_vr)
+            geoms.append(make_pcd(out_v["pts_reduced_vis"], VEH_REDUCED_POINTS_COLOR))
 
     # Infra clouds transformed into vehicle frame
     if show_inf_full and out_i["pts_full_vis"] is not None and out_i["pts_full_vis"].shape[0] > 0:
         inf_full_v = apply_T_points(T_veh_from_inf, out_i["pts_full_vis"])
-        geoms.append(make_pcd(inf_full_v, INF_FULL_POINTS_COLOR))
+        if RENDER_INF_FULL_AS_VOXELGRID:
+            geoms.append(make_voxelgrid_from_points(inf_full_v, INF_FULL_POINTS_COLOR, INF_FULL_VOXELGRID_SIZE))
+        else:
+            geoms.append(make_pcd(inf_full_v, INF_FULL_POINTS_COLOR))
 
     if show_inf_reduced and out_i["pts_reduced_vis"] is not None and out_i["pts_reduced_vis"].shape[0] > 0:
         inf_red_v = apply_T_points(T_veh_from_inf, out_i["pts_reduced_vis"])
-        geoms.append(make_pcd(inf_red_v, INF_REDUCED_POINTS_COLOR))
+        if RENDER_INF_REDUCED_AS_VOXELGRID:
+            geoms.append(make_voxelgrid_from_points(inf_red_v, INF_REDUCED_POINTS_COLOR, INF_REDUCED_VOXELGRID_SIZE))
+        else:
+            geoms.append(make_pcd(inf_red_v, INF_REDUCED_POINTS_COLOR))
 
-    # GT boxes
+    # GT boxes (vehicle already filtered by vehicle pipeline FOV in run_one_side)
     for k in range(out_v["gt_corners"].shape[0]):
         geoms.append(corners_to_lineset(out_v["gt_corners"][k], GT_VEH_COLOR))
 
+    # Infra GT: already filtered by infra pipeline FOV in run_one_side (infra frame), then transformed
     inf_gt_corners_v = apply_T_corners(T_veh_from_inf, out_i["gt_corners"])
+    inf_gt_centers_v = apply_T_points(T_veh_from_inf, out_i["gt_centers"]) if out_i["gt_centers"].shape[0] > 0 else out_i["gt_centers"]
+    if FILTER_INF_IN_VEH_FRAME_BY_VEH_FOV and inf_gt_corners_v.shape[0] > 0:
+        # Filter transformed infra GT by vehicle pipeline FOV envelope (using vehicle pipeline points)
+        dummy_labels = np.zeros((inf_gt_corners_v.shape[0],), dtype=np.int64)
+        inf_gt_corners_v, inf_gt_centers_v, _, _, keep_inf_gt = filter_boxes_by_pipeline_fov(
+            corners=inf_gt_corners_v,
+            centers=inf_gt_centers_v,
+            labels=dummy_labels,
+            pts_pipeline_xyz=out_v["pts_reduced_pipeline"],
+        )
     for k in range(inf_gt_corners_v.shape[0]):
         geoms.append(corners_to_lineset(inf_gt_corners_v[k], GT_INF_COLOR))
 
@@ -898,6 +1054,16 @@ def build_scene_for_sid(
 
     inf_pred_corners_v = apply_T_corners(T_veh_from_inf, out_i["pred_corners"])
     inf_pred_centers_v = apply_T_points(T_veh_from_inf, out_i["pred_centers"]) if out_i["pred_centers"].shape[0] > 0 else out_i["pred_centers"]
+    if FILTER_INF_IN_VEH_FRAME_BY_VEH_FOV and inf_pred_corners_v.shape[0] > 0:
+        dummy_labels = np.zeros((inf_pred_corners_v.shape[0],), dtype=np.int64)
+        inf_pred_corners_v, inf_pred_centers_v, _, _, keep_inf_pr = filter_boxes_by_pipeline_fov(
+            corners=inf_pred_corners_v,
+            centers=inf_pred_centers_v,
+            labels=dummy_labels,
+            pts_pipeline_xyz=out_v["pts_reduced_pipeline"],
+        )
+        out_i["pred_scores"] = out_i["pred_scores"][keep_inf_pr]
+        out_i["pred_labels"] = out_i["pred_labels"][keep_inf_pr]
     for k in range(inf_pred_corners_v.shape[0]):
         geoms.append(corners_to_lineset(inf_pred_corners_v[k], PRED_INF_COLOR))
 
@@ -914,10 +1080,14 @@ def build_scene_for_sid(
         match_dist_m=MATCH_DIST_M,
     )
 
-    if FILTER_FUSED_BY_VEH_FOV and fused_centers.shape[0] > 0:
-        keep_fused = filter_centers_by_fov(fused_centers, out_v["fov"])
-        fused_corners = fused_corners[keep_fused]
-        fused_centers = fused_centers[keep_fused]
+    if FILTER_FUSED_BY_VEH_FOV and fused_corners.shape[0] > 0:
+        dummy_labels = np.zeros((fused_corners.shape[0],), dtype=np.int64)
+        fused_corners, fused_centers, _, _, keep_fused = filter_boxes_by_pipeline_fov(
+            corners=fused_corners,
+            centers=fused_centers,
+            labels=dummy_labels,
+            pts_pipeline_xyz=out_v["pts_reduced_pipeline"],
+        )
         fused_scores = fused_scores[keep_fused]
 
     for k in range(fused_corners.shape[0]):
@@ -927,8 +1097,8 @@ def build_scene_for_sid(
         "sid": sid,
         "idx_v": idx_v,
         "idx_i": idx_i,
-        "veh_fov": out_v["fov"],
-        "inf_fov": out_i["fov"],
+        "veh_fov": out_v["fov_dbg"],
+        "inf_fov": out_i["fov_dbg"],
         "veh_gt": int(out_v["gt_corners"].shape[0]),
         "inf_gt": int(inf_gt_corners_v.shape[0]),
         "veh_pred": int(out_v["pred_corners"].shape[0]),
@@ -960,7 +1130,7 @@ def print_help():
     print("  N : next sample (wrap)")
     print("  B : previous sample (wrap)")
     print("  S : save screenshot to --out-dir")
-    print("  H : help + current status + legend")
+    print("  H : help + status + legend")
     print("  ESC / close window: exit")
 
 
@@ -991,13 +1161,23 @@ def main():
     parser.add_argument("--veh-lidar2novatel-key", default="lidar_to_novatel", type=str)
     parser.add_argument("--inf-lidar2world-key", default="virtuallidar_to_world", type=str)
 
-    # NEW: pointcloud toggles
+    # Pointcloud toggles
     parser.add_argument("--show-veh-full", action="store_true", help="show vehicle FULL velodyne points (if found)")
     parser.add_argument("--hide-veh-reduced", action="store_true", help="hide vehicle REDUCED (pipeline) points")
     parser.add_argument("--show-inf-full", action="store_true", help="show infra FULL velodyne points (if found)")
     parser.add_argument("--hide-inf-reduced", action="store_true", help="hide infra REDUCED (pipeline) points")
 
+    # Optional: override cube sizes from CLI
+    parser.add_argument("--veh-reduced-cube", default=None, type=float, help="override VEH_REDUCED_VOXELGRID_SIZE")
+    parser.add_argument("--inf-reduced-cube", default=None, type=float, help="override INF_REDUCED_VOXELGRID_SIZE")
+
     args = parser.parse_args()
+
+    global VEH_REDUCED_VOXELGRID_SIZE, INF_REDUCED_VOXELGRID_SIZE
+    if args.veh_reduced_cube is not None and args.veh_reduced_cube > 0:
+        VEH_REDUCED_VOXELGRID_SIZE = float(args.veh_reduced_cube)
+    if args.inf_reduced_cube is not None and args.inf_reduced_cube > 0:
+        INF_REDUCED_VOXELGRID_SIZE = float(args.inf_reduced_cube)
 
     register_all_modules(init_default_scope=True)
 
