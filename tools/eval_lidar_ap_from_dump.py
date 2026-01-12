@@ -7,6 +7,11 @@ No transforms, no calib, no KITTI camera conversion.
 
 Requires mmcv.ops.box_iou_rotated.
 
+IMPORTANT:
+- This evaluates the boxes stored in the dump.
+- If you used the updated dump_pred_gt_lidar.py, those GT/preds are already filtered
+  to only those within the reduced/pipeline LiDAR FOV (pure angular test).
+
 Usage:
   python3 tools/eval_lidar_ap_from_dump.py dump.pkl
 """
@@ -192,11 +197,18 @@ def main():
     classes = list(dump["classes"])
     samples = dump["samples"]
 
-    # KITTI-like strict/loose thresholds (same as what MMDet3D prints in your log)
+    # Print FOV filter settings if present (sanity)
+    fcfg = dump.get("fov_filter", None)
+    if isinstance(fcfg, dict):
+        print("[INFO] Dump contains FOV filter settings:")
+        for k in sorted(fcfg.keys()):
+            print(f"  - {k}: {fcfg[k]}")
+
+    # KITTI-like strict/loose thresholds (same style as MMDet3D logs)
     thr_strict = {"Pedestrian": 0.50, "Cyclist": 0.50, "Car": 0.70}
     thr_loose  = {"Pedestrian": 0.25, "Cyclist": 0.25, "Car": 0.50}
 
-    # If your classes list differs, default to 0.5
+    # If your classes list differs, default to 0.5 / 0.25
     for c in classes:
         if c not in thr_strict:
             thr_strict[c] = 0.50
