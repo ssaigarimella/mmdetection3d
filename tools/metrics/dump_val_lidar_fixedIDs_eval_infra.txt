@@ -1,0 +1,25 @@
+[INFO] dump_pkl: work_dirs/pp_infra_synth_3class/dump_val_lidar_fixedIDs.pkl
+[INFO] run_tag: infra
+[INFO] timestamp: 2026-01-12 17:32:24
+[INFO] num_samples: 599
+[INFO] classes: ['Pedestrian', 'Cyclist', 'Car']
+[INFO] Dump contains FOV filter settings:
+  - az_margin_deg: 0.25
+  - azimuth_pcts: (0.5, 99.5)
+  - box_test: center
+  - el_margin_deg: 0.25
+  - elevation_pcts: (0.5, 99.5)
+  - filter_gt: True
+  - filter_pred: True
+  - min_pts_for_fov: 64
+  - use_percentiles: True
+
+=== STRICT ===
+Pedestrian IoU=0.50 | BEV AP11=32.6298 AP40=30.7182 | 3D AP11=17.3250 AP40=15.8011
+Cyclist: no GT
+Car IoU=0.70 | BEV AP11=38.2090 AP40=35.3166 | 3D AP11=10.2125 AP40=6.8210
+
+=== LOOSE ===
+Pedestrian IoU=0.25 | BEV AP11=45.2309 AP40=39.7787 | 3D AP11=36.2612 AP40=39.7508
+Cyclist: no GT
+Car IoU=0.50 | BEV AP11=53.0840 AP40=55.6586 | 3D AP11=51.6531 AP40=51.8186

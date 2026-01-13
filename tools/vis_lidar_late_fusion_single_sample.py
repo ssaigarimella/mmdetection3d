@@ -6,24 +6,19 @@ Open3D visual checker for DAIR-V2X-style LiDAR late fusion baseline:
 - Runs Vehicle detector and Infra detector on paired sample-id (paired by LiDAR filename stem).
 - Visualizes everything in VEHICLE LiDAR frame.
 
-Point clouds (all in vehicle frame):
-  - vehicle FULL velodyne (optional)
-  - vehicle REDUCED velodyne_reduced (pipeline points; always available)  -> rendered as COLORED CUBES (VoxelGrid)
-  - infra FULL velodyne transformed into vehicle frame (optional)
-  - infra REDUCED velodyne_reduced transformed into vehicle frame (pipeline points; always available) -> rendered as COLORED CUBES (VoxelGrid)
+This version fixes the “boxes float higher / misaligned” issue by making the
+infra->vehicle transform robust:
 
-Boxes (all in vehicle frame):
-  - vehicle GT boxes (filtered by vehicle reduced-LiDAR FOV)
-  - infra GT boxes transformed into vehicle frame (filtered by infra reduced-LiDAR FOV)
-  - vehicle preds (filtered by vehicle reduced-LiDAR FOV)
-  - infra preds transformed into vehicle frame (filtered by infra reduced-LiDAR FOV)
-  - fused preds after Hungarian matching, optionally filtered by vehicle reduced-LiDAR FOV
+Instead of assuming every JSON rigid transform is always "world_from_sensor",
+we auto-select the correct inversion combination (for the 3 JSON transforms)
+by scoring how well the transformed INFRA reduced points overlap the VEHICLE
+reduced points (nearest-neighbor distance). This fixes common cases where one
+or more JSONs are actually "sensor_from_world" or "novatel_from_lidar", etc.
 
-IMPORTANT FIX:
-- The old version filtered GT by CENTER angles only, with a loose FOV estimate.
-- This version matches tools/vis_single_sample_pred_gt.py semantics:
-    * infer reduced-LiDAR FOV envelope from PIPELINE points (az, el, range)
-    * keep a box if ANY corner is inside that envelope.
+Additionally, this version fixes the specific symptom:
+- prediction boxes are exactly +1x their own height above GT boxes
+by shifting PRED boxes down by 1x their own height (z -= height),
+without moving GT boxes.
 """
 
 import argparse
@@ -63,7 +58,6 @@ INF_FULL_POINTS_COLOR      = (0.05, 0.20, 0.60)  # dark blue
 VEH_REDUCED_POINTS_COLOR   = (0.00, 1.00, 1.00)  # bright cyan
 INF_REDUCED_POINTS_COLOR   = (1.00, 1.00, 0.00)  # bright yellow
 
-# Make GT colors vastly different from each other and from the warm colors.
 GT_VEH_COLOR               = (0.00, 1.00, 0.00)  # pure bright green
 GT_INF_COLOR               = (0.10, 0.10, 1.00)  # bright blue
 
@@ -85,18 +79,23 @@ INF_FULL_VOXELGRID_SIZE = 0.12
 # -------------------------
 # BOX VISIBILITY (THICK LINES)
 # -------------------------
-# Open3D LineSet line width is often ignored depending on backend/OS.
-# To make boxes "perfectly visible", we render boxes as thick cylinders along edges.
 USE_THICK_BOX_EDGES = True
-BOX_EDGE_RADIUS_M = 0.035          # thickness in meters (increase if needed)
-BOX_EDGE_CYL_RES = 10              # cylinder resolution (higher = smoother)
-# Fallback: also try setting render_option.line_width where supported.
+BOX_EDGE_RADIUS_M = 0.035
+BOX_EDGE_CYL_RES = 10
 TRY_SET_LINE_WIDTH = True
 LINE_WIDTH_FALLBACK = 6.0
 
+# -------------------------
+# PREDICTION Z FIX
+# -------------------------
+# Symptom you reported: pred centers are exactly +1x box height above GT centers.
+# Fix: shift predictions down by 1x their own height (z -= height).
+FIX_PRED_Z_BY_OWN_HEIGHT = True
+PRED_Z_HEIGHT_FACTOR = -1.0  # -1.0 means shift down by exactly 1x height
+
 
 # ============================================================
-# FOV SETTINGS (reduced LiDAR)  [FIXED TO MATCH vis_single_sample_pred_gt.py]
+# FOV SETTINGS (reduced LiDAR)
 # ============================================================
 
 FOV_SUBSAMPLE_MAX_POINTS = 120000
@@ -131,6 +130,22 @@ FUSE_POLICY = "pick_best"  # when matched, pick the higher-score box
 
 
 # ============================================================
+# Native GT settings
+# ============================================================
+
+USE_NATIVE_LIDAR_GT = True
+
+TYPE_TO_LABEL = {
+    "Car": 0,
+    "Vehicle": 0,
+    "Pedestrian": 1,
+    "Person": 1,
+    "Cyclist": 2,
+    "Bicycle": 2,
+}
+
+
+# ============================================================
 # Legend
 # ============================================================
 
@@ -150,6 +165,10 @@ def print_legend() -> None:
     print(f"  INF_REDUCED_VOXELGRID_SIZE={INF_REDUCED_VOXELGRID_SIZE}")
     print("[BOX THICKNESS]")
     print(f"  USE_THICK_BOX_EDGES={USE_THICK_BOX_EDGES} BOX_EDGE_RADIUS_M={BOX_EDGE_RADIUS_M}")
+    print("[GT SOURCE]")
+    print(f"  USE_NATIVE_LIDAR_GT={USE_NATIVE_LIDAR_GT}")
+    print("[PRED Z FIX]")
+    print(f"  FIX_PRED_Z_BY_OWN_HEIGHT={FIX_PRED_Z_BY_OWN_HEIGHT} PRED_Z_HEIGHT_FACTOR={PRED_Z_HEIGHT_FACTOR}")
 
 
 # -------------------------
@@ -350,6 +369,29 @@ def build_common_ids_in_vehicle_order(ids_v: Dict[str, int], ids_i: Dict[str, in
 # Boxes extraction from MMDet3D outputs + eval_ann_info
 # -------------------------
 
+def _shift_boxes_z_by_own_height(
+    corners: np.ndarray,
+    centers: np.ndarray,
+    factor: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if corners is None or corners.shape[0] == 0:
+        return corners, centers
+    c = np.asarray(corners, dtype=np.float64)
+    zmin = np.min(c[:, :, 2], axis=1)
+    zmax = np.max(c[:, :, 2], axis=1)
+    h = np.maximum(1e-9, zmax - zmin)  # (N,)
+    dz = (float(factor) * h).astype(np.float64)  # (N,)
+
+    corners2 = c.copy()
+    corners2[:, :, 2] += dz[:, None]
+
+    if centers is None or centers.shape[0] != corners.shape[0]:
+        centers2 = corners2.mean(axis=1)
+    else:
+        centers2 = np.asarray(centers, dtype=np.float64).copy()
+        centers2[:, 2] += dz
+    return corners2, centers2
+
 def pred_from_output(pred_sample, score_thr: float) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     pred_instances = getattr(pred_sample, "pred_instances_3d", None)
     if pred_instances is None or not hasattr(pred_instances, "bboxes_3d"):
@@ -359,30 +401,75 @@ def pred_from_output(pred_sample, score_thr: float) -> Tuple[np.ndarray, np.ndar
                 np.zeros((0,), np.int64))
 
     boxes = pred_instances.bboxes_3d
-    if boxes is None or not hasattr(boxes, "corners") or not hasattr(boxes, "tensor"):
+    if boxes is None or not hasattr(boxes, "tensor"):
         return (np.zeros((0, 8, 3), np.float64),
                 np.zeros((0, 3), np.float64),
                 np.zeros((0,), np.float64),
                 np.zeros((0,), np.int64))
 
-    corners = boxes.corners.detach().cpu().numpy().astype(np.float64)
-    centers = boxes.tensor.detach().cpu().numpy().astype(np.float64)[:, :3]
-
     scores = getattr(pred_instances, "scores_3d", None)
     labels = getattr(pred_instances, "labels_3d", None)
 
     if scores is None:
-        scores_np = np.ones((corners.shape[0],), dtype=np.float64)
+        scores_np = np.ones((len(boxes),), dtype=np.float64)
     else:
         scores_np = scores.detach().cpu().numpy().astype(np.float64) if not isinstance(scores, np.ndarray) else scores.astype(np.float64)
 
     if labels is None:
-        labels_np = np.zeros((corners.shape[0],), dtype=np.int64)
+        labels_np = np.zeros((len(boxes),), dtype=np.int64)
     else:
         labels_np = labels.detach().cpu().numpy().astype(np.int64) if not isinstance(labels, np.ndarray) else labels.astype(np.int64)
 
     keep = scores_np >= float(score_thr)
-    return corners[keep], centers[keep], scores_np[keep], labels_np[keep]
+    if not np.any(keep):
+        return (np.zeros((0, 8, 3), np.float64),
+                np.zeros((0, 3), np.float64),
+                np.zeros((0,), np.float64),
+                np.zeros((0,), np.int64))
+
+    # MMDet3D lidar boxes are typically (x, y, z, dx, dy, dz, yaw)
+    t = boxes.tensor.detach().cpu().numpy().astype(np.float64)
+
+    # Use gravity_center when available
+    if hasattr(boxes, "gravity_center"):
+        centers_all = boxes.gravity_center.detach().cpu().numpy().astype(np.float64)
+    else:
+        centers_all = t[:, :3].copy()
+        # fallback: assume tensor xyz is bottom-center and convert to center
+        if t.shape[1] > 5:
+            centers_all[:, 2] += 0.5 * t[:, 5]
+
+    dx = t[:, 3]
+    dy = t[:, 4]
+    dz = t[:, 5]
+    yaw = t[:, 6] if t.shape[1] > 6 else np.zeros((t.shape[0],), dtype=np.float64)
+
+    corners_list = []
+    centers_list = []
+    for i in range(t.shape[0]):
+        c = centers_all[i]
+        dims_hwl = np.array([dz[i], dy[i], dx[i]], dtype=np.float64)  # h,w,l
+        corners_list.append(box_corners_from_center_dims_yaw(c, dims_hwl, float(yaw[i])))
+        centers_list.append(c)
+
+    corners_all = np.stack(corners_list, axis=0).astype(np.float64)
+    centers_all = np.stack(centers_list, axis=0).astype(np.float64)
+
+    corners_kept = corners_all[keep]
+    centers_kept = centers_all[keep]
+    scores_kept = scores_np[keep]
+    labels_kept = labels_np[keep]
+
+    # Apply the exact fix you described (do NOT touch GT).
+    if FIX_PRED_Z_BY_OWN_HEIGHT and corners_kept.shape[0] > 0:
+        corners_kept, centers_kept = _shift_boxes_z_by_own_height(
+            corners=corners_kept,
+            centers=centers_kept,
+            factor=float(PRED_Z_HEIGHT_FACTOR),
+        )
+
+    return corners_kept, centers_kept, scores_kept, labels_kept
+
 
 def gt_from_eval_ann_info(dataset, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     ensure_full_init(dataset)
@@ -406,12 +493,131 @@ def gt_from_eval_ann_info(dataset, idx: int) -> Tuple[np.ndarray, np.ndarray, np
                 np.zeros((0,), np.int64))
 
     corners = gt_boxes.corners.detach().cpu().numpy().astype(np.float64)
-    centers = gt_boxes.tensor.detach().cpu().numpy().astype(np.float64)[:, :3]
+    centers = corners.mean(axis=1)
     if gt_labels is None:
         labels = np.zeros((corners.shape[0],), dtype=np.int64)
     else:
         labels = gt_labels.detach().cpu().numpy().astype(np.int64) if not isinstance(gt_labels, np.ndarray) else gt_labels.astype(np.int64)
     return corners, centers, labels
+
+
+# ============================================================
+# Native LiDAR GT labels (NON_KITTI_ROOT)
+# ============================================================
+
+def _as_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float, np.number)):
+            return float(x)
+        if isinstance(x, str):
+            return float(x.strip())
+        if isinstance(x, dict):
+            for k in ("value", "val", "data", "v"):
+                if k in x:
+                    return _as_float(x[k], default)
+    except Exception:
+        return default
+    return default
+
+def get_coop_root(non_kitti_root: Path) -> Path:
+    cand = non_kitti_root / "cooperative-vehicle-infrastructure"
+    if cand.is_dir():
+        return cand
+    return non_kitti_root
+
+def load_native_lidar_labels(coop_root: Path, side: str, sample_id: str) -> List[Dict]:
+    if side not in ("vehicle-side", "infrastructure-side"):
+        raise ValueError("side must be 'vehicle-side' or 'infrastructure-side'")
+
+    p = coop_root / side / "label" / "lidar" / f"{sample_id}.json"
+    if not p.is_file():
+        hits = sorted(coop_root.rglob(f"{sample_id}.json"))
+        hits = [h for h in hits if ("/label/lidar/" in h.as_posix().lower()) and (side in h.as_posix())]
+        if not hits:
+            raise FileNotFoundError(f"Missing native lidar label json for {side} id={sample_id} under {coop_root}")
+        p = hits[0]
+
+    data = json.loads(p.read_text())
+    recs = data if isinstance(data, list) else data.get("labels", data.get("annotations", []))
+
+    out = []
+    for g in recs or []:
+        typ = g.get("type", "Car")
+        dims = g.get("3d_dimensions", {}) or {}
+        loc  = g.get("3d_location", {}) or {}
+
+        h = _as_float(dims.get("h"), 0.0)
+        w = _as_float(dims.get("w"), 0.0)
+        l = _as_float(dims.get("l"), 0.0)
+
+        cx = _as_float(loc.get("x"), 0.0)
+        cy = _as_float(loc.get("y"), 0.0)
+        cz = _as_float(loc.get("z"), 0.0)
+
+        # If your native lidar labels store z at a different origin (bottom/top),
+        # you must normalize cz here. In this script we assume your GT is already correct.
+        # Example bottom->center would be: cz = cz + 0.5 * h
+
+        yaw = _as_float(g.get("rotation", g.get("yaw", 0.0)), 0.0)
+
+        out.append({
+            "type": typ,
+            "center": np.array([cx, cy, cz], dtype=np.float64),
+            "dims_hwl": np.array([h, w, l], dtype=np.float64),
+            "yaw": float(yaw),
+        })
+    return out
+
+def box_corners_from_center_dims_yaw(center_xyz: np.ndarray, dims_hwl: np.ndarray, yaw_rad: float) -> np.ndarray:
+    c = np.asarray(center_xyz, dtype=np.float64).reshape(3)
+    h, w, l = [float(x) for x in np.asarray(dims_hwl, dtype=np.float64).reshape(3)]
+
+    if h <= 0 or w <= 0 or l <= 0:
+        return np.tile(c[None, :], (8, 1))
+
+    x_c = np.array([ l/2,  l/2, -l/2, -l/2,  l/2,  l/2, -l/2, -l/2], dtype=np.float64)
+    y_c = np.array([ w/2, -w/2, -w/2,  w/2,  w/2, -w/2, -w/2,  w/2], dtype=np.float64)
+    z_c = np.array([-h/2, -h/2, -h/2, -h/2,  h/2,  h/2,  h/2,  h/2], dtype=np.float64)
+
+    pts = np.stack([x_c, y_c, z_c], axis=1)
+
+    cy = float(np.cos(yaw_rad))
+    sy = float(np.sin(yaw_rad))
+    R = np.array([[cy, -sy, 0.0],
+                  [sy,  cy, 0.0],
+                  [0.0, 0.0, 1.0]], dtype=np.float64)
+
+    pts = (R @ pts.T).T
+    pts = pts + c[None, :]
+    return pts
+
+def gt_from_native_lidar_labels(coop_root: Path, side: str, sid: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    recs = load_native_lidar_labels(coop_root=coop_root, side=side, sample_id=sid)
+    if not recs:
+        return (np.zeros((0, 8, 3), np.float64),
+                np.zeros((0, 3), np.float64),
+                np.zeros((0,), np.int64))
+
+    corners_list = []
+    centers_list = []
+    labels_list = []
+
+    for r in recs:
+        center = r["center"]
+        dims = r["dims_hwl"]
+        yaw = r["yaw"]
+        typ = str(r.get("type", "Car"))
+
+        corners = box_corners_from_center_dims_yaw(center, dims, yaw)
+        corners_list.append(corners.astype(np.float64))
+        centers_list.append(center.astype(np.float64))
+        labels_list.append(int(TYPE_TO_LABEL.get(typ, 0)))
+
+    corners = np.stack(corners_list, axis=0).astype(np.float64)
+    centers = corners.mean(axis=1)
+    return (corners, centers, np.array(labels_list, dtype=np.int64))
 
 
 # ============================================================
@@ -649,12 +855,6 @@ def apply_T_corners(T: np.ndarray, corners: np.ndarray) -> np.ndarray:
     c2 = apply_T_points(T, c)
     return c2.reshape(corners.shape[0], 8, 3)
 
-def get_coop_root(non_kitti_root: Path) -> Path:
-    cand = non_kitti_root / "cooperative-vehicle-infrastructure"
-    if cand.is_dir():
-        return cand
-    return non_kitti_root
-
 def find_transform_json(root: Path, sample_id: str, must_contain: str) -> Path:
     sample_name = f"{sample_id}.json"
     hits = []
@@ -669,14 +869,52 @@ def find_transform_json(root: Path, sample_id: str, must_contain: str) -> Path:
         )
     return hits[0]
 
+
+def _nn_score(veh_pts: np.ndarray, inf_pts_in_veh: np.ndarray, max_pairs: int = 12000) -> float:
+    """Median NN distance from a subsample of inf_pts_in_veh to veh_pts."""
+    if veh_pts is None or inf_pts_in_veh is None:
+        return 1e18
+    if veh_pts.shape[0] < 50 or inf_pts_in_veh.shape[0] < 50:
+        return 1e18
+
+    A = _subsample_rows(veh_pts, max_pairs)
+    B = _subsample_rows(inf_pts_in_veh, max_pairs)
+
+    try:
+        from scipy.spatial import cKDTree
+        tree = cKDTree(A)
+        d, _ = tree.query(B, k=1, workers=-1)
+        d = np.asarray(d, dtype=np.float64)
+        if d.size == 0:
+            return 1e18
+        return float(np.median(d))
+    except Exception:
+        A2 = _subsample_rows(A, 2000)
+        B2 = _subsample_rows(B, 2000)
+        if A2.shape[0] == 0 or B2.shape[0] == 0:
+            return 1e18
+        diff = B2[:, None, :] - A2[None, :, :]
+        dist = np.sqrt(np.sum(diff * diff, axis=2) + 1e-12)
+        dmin = np.min(dist, axis=1)
+        return float(np.median(dmin))
+
+
 def compute_T_veh_from_inf_from_json(
     coop_root: Path,
     sid: str,
     veh_novatel_key: str,
     veh_lidar_to_novatel_key: str,
     inf_lidar_to_world_key: str,
+    veh_pts_reduced: np.ndarray,
+    inf_pts_reduced: np.ndarray,
     debug_print: bool = False,
-) -> Tuple[np.ndarray, Dict[str, str]]:
+) -> Tuple[np.ndarray, Dict[str, Any]]:
+    """
+    Robustly compute T_veh_from_inf by trying inversion combinations for the
+    three JSON transforms and selecting the one that best aligns INF reduced
+    points onto VEH reduced points.
+    """
+
     veh_novatel_to_world_json = find_transform_json(coop_root, sid, veh_novatel_key)
     veh_lidar_to_novatel_json = find_transform_json(coop_root, sid, veh_lidar_to_novatel_key)
     inf_lidar_to_world_json   = find_transform_json(coop_root, sid, inf_lidar_to_world_key)
@@ -687,21 +925,50 @@ def compute_T_veh_from_inf_from_json(
         print("  veh lidar_to_novatel:", veh_lidar_to_novatel_json)
         print("  inf lidar_to_world  :", inf_lidar_to_world_json)
 
-    T_world_from_veh_novatel     = parse_rigid_json(veh_novatel_to_world_json)
-    T_veh_novatel_from_veh_lidar = parse_rigid_json(veh_lidar_to_novatel_json)
-    T_world_from_veh_lidar       = T_world_from_veh_novatel @ T_veh_novatel_from_veh_lidar
+    T1_raw = parse_rigid_json(veh_novatel_to_world_json)
+    T2_raw = parse_rigid_json(veh_lidar_to_novatel_json)
+    T3_raw = parse_rigid_json(inf_lidar_to_world_json)
 
-    T_world_from_inf_lidar       = parse_rigid_json(inf_lidar_to_world_json)
+    best = {
+        "score": 1e18,
+        "mask": (0, 0, 0),
+        "T_veh_from_inf": np.eye(4, dtype=np.float64),
+    }
 
-    T_veh_from_world = inv_T(T_world_from_veh_lidar)
-    T_veh_from_inf   = T_veh_from_world @ T_world_from_inf_lidar
+    for m1 in (0, 1):
+        for m2 in (0, 1):
+            for m3 in (0, 1):
+                T_world_from_veh_novatel = inv_T(T1_raw) if m1 else T1_raw
+                T_veh_novatel_from_veh_lidar = inv_T(T2_raw) if m2 else T2_raw
+                T_world_from_inf_lidar = inv_T(T3_raw) if m3 else T3_raw
 
+                T_world_from_veh_lidar = T_world_from_veh_novatel @ T_veh_novatel_from_veh_lidar
+                T_veh_from_world = inv_T(T_world_from_veh_lidar)
+                T_veh_from_inf = T_veh_from_world @ T_world_from_inf_lidar
+
+                inf_in_veh = apply_T_points(T_veh_from_inf, inf_pts_reduced)
+                score = _nn_score(veh_pts_reduced, inf_in_veh, max_pairs=12000)
+
+                if score < best["score"]:
+                    best["score"] = score
+                    best["mask"] = (m1, m2, m3)
+                    best["T_veh_from_inf"] = T_veh_from_inf
+
+    m1, m2, m3 = best["mask"]
     src = {
         "veh_novatel_to_world": str(veh_novatel_to_world_json),
         "veh_lidar_to_novatel": str(veh_lidar_to_novatel_json),
         "inf_lidar_to_world": str(inf_lidar_to_world_json),
+        "auto_invert_mask": {"invert_T1": bool(m1), "invert_T2": bool(m2), "invert_T3": bool(m3)},
+        "auto_score_median_nn_m": float(best["score"]),
+        "note": "auto-selected inversion mask via reduced-point alignment",
     }
-    return T_veh_from_inf, src
+
+    if debug_print:
+        print("[DEBUG] auto transform selection:")
+        print("  invert mask (T1,T2,T3) =", best["mask"], "median_nn_m =", best["score"])
+
+    return best["T_veh_from_inf"], src
 
 
 # -------------------------
@@ -811,11 +1078,9 @@ def fuse_preds(
     if len(fused_corners) == 0:
         return np.zeros((0, 8, 3), np.float64), np.zeros((0, 3), np.float64), np.zeros((0,), np.float64)
 
-    return (
-        np.stack(fused_corners, axis=0).astype(np.float64),
-        np.stack(fused_centers, axis=0).astype(np.float64),
-        np.array(fused_scores, dtype=np.float64),
-    )
+    fused_c = np.stack(fused_corners, axis=0).astype(np.float64)
+    fused_cent = fused_c.mean(axis=1)
+    return (fused_c, fused_cent, np.array(fused_scores, dtype=np.float64))
 
 
 # -------------------------
@@ -852,15 +1117,11 @@ def _rot_from_a_to_b(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     b = b / (np.linalg.norm(b) + 1e-12)
     v = np.cross(a, b)
     c = float(np.dot(a, b))
-    if c > 1.0:
-        c = 1.0
-    if c < -1.0:
-        c = -1.0
+    c = max(-1.0, min(1.0, c))
 
     if np.linalg.norm(v) < 1e-10:
         if c > 0.0:
             return np.eye(3, dtype=np.float64)
-        # 180 deg, pick an orthogonal axis
         axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
         if abs(a[0]) > 0.9:
             axis = np.array([0.0, 1.0, 0.0], dtype=np.float64)
@@ -921,7 +1182,17 @@ def add_box_geom(geoms: List[o3d.geometry.Geometry], corners_8x3: np.ndarray, co
 # One-side inference wrapper
 # -------------------------
 
-def run_one_side(dataset, model, idx: int, score_thr: float, want_full_points: bool) -> Dict[str, Any]:
+def run_one_side(
+    dataset,
+    model,
+    idx: int,
+    score_thr: float,
+    want_full_points: bool,
+    sid: str,
+    coop_root: Path,
+    side_name: str,
+    use_native_gt: bool,
+) -> Dict[str, Any]:
     ensure_full_init(dataset)
     info = _get_data_info(dataset, idx) or {}
 
@@ -953,7 +1224,19 @@ def run_one_side(dataset, model, idx: int, score_thr: float, want_full_points: b
                 pts_full_vis = None
                 full_path_used = None
 
-    gt_corners, gt_centers, gt_labels = gt_from_eval_ann_info(dataset, idx)
+    gt_src = "eval_ann_info"
+    if use_native_gt:
+        try:
+            gt_corners, gt_centers, gt_labels = gt_from_native_lidar_labels(
+                coop_root=coop_root, side=side_name, sid=sid
+            )
+            gt_src = f"native:{side_name}/label/lidar"
+        except Exception:
+            gt_corners, gt_centers, gt_labels = gt_from_eval_ann_info(dataset, idx)
+            gt_src = "eval_ann_info (native missing)"
+    else:
+        gt_corners, gt_centers, gt_labels = gt_from_eval_ann_info(dataset, idx)
+
     pred_corners, pred_centers, pred_scores, pred_labels = pred_from_output(pred_sample, score_thr=score_thr)
 
     fov_dbg = compute_pipeline_fov(pts_reduced_pipeline)
@@ -998,6 +1281,7 @@ def run_one_side(dataset, model, idx: int, score_thr: float, want_full_points: b
         "gt_corners": gt_corners,
         "gt_centers": gt_centers,
         "gt_labels": gt_labels,
+        "gt_src": gt_src,
         "pred_corners": pred_corners,
         "pred_centers": pred_centers,
         "pred_scores": pred_scores,
@@ -1022,7 +1306,7 @@ def build_scene_for_sid(
     veh_novatel_key: str,
     veh_lidar_to_novatel_key: str,
     inf_lidar_to_world_key: str,
-    T_cache: Dict[str, Tuple[np.ndarray, Dict[str, str]]],
+    T_cache: Dict[str, Tuple[np.ndarray, Dict[str, Any]]],
     show_veh_full: bool,
     show_veh_reduced: bool,
     show_inf_full: bool,
@@ -1030,12 +1314,27 @@ def build_scene_for_sid(
     debug_print: bool,
     only_veh: bool,
     only_inf: bool,
+    use_native_gt: bool,
 ) -> Tuple[List[o3d.geometry.Geometry], Dict[str, Any]]:
     idx_v = id2idx_v[sid]
     idx_i = id2idx_i[sid]
 
-    out_v = run_one_side(dataset_v, model_v, idx_v, score_thr=score_thr, want_full_points=show_veh_full)
-    out_i = run_one_side(dataset_i, model_i, idx_i, score_thr=score_thr, want_full_points=show_inf_full)
+    out_v = run_one_side(
+        dataset_v, model_v, idx_v,
+        score_thr=score_thr,
+        want_full_points=show_veh_full,
+        sid=sid, coop_root=coop_root,
+        side_name="vehicle-side",
+        use_native_gt=use_native_gt,
+    )
+    out_i = run_one_side(
+        dataset_i, model_i, idx_i,
+        score_thr=score_thr,
+        want_full_points=show_inf_full,
+        sid=sid, coop_root=coop_root,
+        side_name="infrastructure-side",
+        use_native_gt=use_native_gt,
+    )
 
     if sid in T_cache:
         T_veh_from_inf, src = T_cache[sid]
@@ -1046,6 +1345,8 @@ def build_scene_for_sid(
             veh_novatel_key=veh_novatel_key,
             veh_lidar_to_novatel_key=veh_lidar_to_novatel_key,
             inf_lidar_to_world_key=inf_lidar_to_world_key,
+            veh_pts_reduced=out_v["pts_reduced_pipeline"],
+            inf_pts_reduced=out_i["pts_reduced_pipeline"],
             debug_print=debug_print,
         )
         T_cache[sid] = (T_veh_from_inf, src)
@@ -1088,7 +1389,7 @@ def build_scene_for_sid(
         add_box_geom(geoms, out_v["gt_corners"][k], GT_VEH_COLOR)
 
     inf_gt_corners_v = apply_T_corners(T_veh_from_inf, out_i["gt_corners"])
-    inf_gt_centers_v = apply_T_points(T_veh_from_inf, out_i["gt_centers"]) if out_i["gt_centers"].shape[0] > 0 else out_i["gt_centers"]
+    inf_gt_centers_v = inf_gt_corners_v.mean(axis=1) if inf_gt_corners_v.shape[0] > 0 else out_i["gt_centers"]
     if FILTER_INF_IN_VEH_FRAME_BY_VEH_FOV and inf_gt_corners_v.shape[0] > 0:
         dummy_labels = np.zeros((inf_gt_corners_v.shape[0],), dtype=np.int64)
         inf_gt_corners_v, inf_gt_centers_v, _, _, _ = filter_boxes_by_pipeline_fov(
@@ -1106,7 +1407,7 @@ def build_scene_for_sid(
             add_box_geom(geoms, out_v["pred_corners"][k], PRED_VEH_COLOR)
 
     inf_pred_corners_v = apply_T_corners(T_veh_from_inf, out_i["pred_corners"])
-    inf_pred_centers_v = apply_T_points(T_veh_from_inf, out_i["pred_centers"]) if out_i["pred_centers"].shape[0] > 0 else out_i["pred_centers"]
+    inf_pred_centers_v = inf_pred_corners_v.mean(axis=1) if inf_pred_corners_v.shape[0] > 0 else out_i["pred_centers"]
     if FILTER_INF_IN_VEH_FRAME_BY_VEH_FOV and inf_pred_corners_v.shape[0] > 0:
         dummy_labels = np.zeros((inf_pred_corners_v.shape[0],), dtype=np.int64)
         inf_pred_corners_v, inf_pred_centers_v, _, _, keep_inf_pr = filter_boxes_by_pipeline_fov(
@@ -1160,6 +1461,8 @@ def build_scene_for_sid(
         "inf_fov": out_i["fov_dbg"],
         "veh_gt": int(out_v["gt_corners"].shape[0]),
         "inf_gt": int(inf_gt_corners_v.shape[0]),
+        "veh_gt_src": out_v.get("gt_src"),
+        "inf_gt_src": out_i.get("gt_src"),
         "veh_pred": int(out_v["pred_corners"].shape[0]) if draw_veh_pred else 0,
         "inf_pred": int(inf_pred_corners_v.shape[0]) if draw_inf_pred else 0,
         "fused_pred": fused_pred_count,
@@ -1170,12 +1473,14 @@ def build_scene_for_sid(
         "inf_full_path": out_i.get("full_path"),
         "only_veh": bool(only_veh),
         "only_inf": bool(only_inf),
+        "use_native_gt": bool(use_native_gt),
     }
 
     if debug_print:
         print(f"[DEBUG] pair-id={sid} idx_v={idx_v} idx_i={idx_i}")
         print("[DEBUG] veh_fov:", dbg["veh_fov"])
         print("[DEBUG] inf_fov:", dbg["inf_fov"])
+        print("[DEBUG] gt_src veh:", dbg["veh_gt_src"], "inf:", dbg["inf_gt_src"])
         print("[DEBUG] transform src:", dbg["transform_src"])
         print("[DEBUG] veh reduced path:", dbg["veh_reduced_path"])
         print("[DEBUG] veh full path   :", dbg["veh_full_path"])
@@ -1242,6 +1547,8 @@ def main():
     parser.add_argument("--only-veh", action="store_true", help="Render ONLY vehicle preds (still render union GT).")
     parser.add_argument("--only-inf", action="store_true", help="Render ONLY infra preds (still render union GT).")
 
+    parser.add_argument("--no-native-gt", action="store_true", help="Disable native lidar GT; use eval_ann_info instead.")
+
     args = parser.parse_args()
 
     if args.only_veh and args.only_inf:
@@ -1293,7 +1600,9 @@ def main():
     show_inf_full = bool(args.show_inf_full)
     show_inf_reduced = not bool(args.hide_inf_reduced)
 
-    T_cache: Dict[str, Tuple[np.ndarray, Dict[str, str]]] = {}
+    use_native_gt = (USE_NATIVE_LIDAR_GT and (not bool(args.no_native_gt)))
+
+    T_cache: Dict[str, Tuple[np.ndarray, Dict[str, Any]]] = {}
 
     print(f"[INFO] vehicle split len={len(dataset_v)}, infra split len={len(dataset_i)}")
     print(f"[INFO] common pair-ids = {len(common_ids)}")
@@ -1301,6 +1610,7 @@ def main():
     print(f"[INFO] non_kitti_root={non_kitti_root}")
     print(f"[INFO] coop_root={coop_root}")
     print(f"[INFO] show clouds: veh_full={show_veh_full}, veh_reduced={show_veh_reduced}, inf_full={show_inf_full}, inf_reduced={show_inf_reduced}")
+    print(f"[INFO] GT source preference: native={use_native_gt} (disable with --no-native-gt)")
     if args.only_veh:
         print("[INFO] render mode: ONLY vehicle predictions (union GT still shown)")
     if args.only_inf:
@@ -1343,6 +1653,7 @@ def main():
                 debug_print=bool(args.debug_print),
                 only_veh=bool(args.only_veh),
                 only_inf=bool(args.only_inf),
+                use_native_gt=use_native_gt,
             )
             state["last_dbg"] = dbg
 
@@ -1355,7 +1666,10 @@ def main():
             print(
                 f"[INFO] pair-id={sid} | "
                 f"veh_gt={dbg['veh_gt']} inf_gt={dbg['inf_gt']} | "
-                f"veh_pred={dbg['veh_pred']} inf_pred={dbg['inf_pred']} fused={dbg['fused_pred']}"
+                f"veh_pred={dbg['veh_pred']} inf_pred={dbg['inf_pred']} fused={dbg['fused_pred']} | "
+                f"gt_src veh={dbg.get('veh_gt_src')} inf={dbg.get('inf_gt_src')} | "
+                f"auto_nn_m={dbg['transform_src'].get('auto_score_median_nn_m', None)} "
+                f"mask={dbg['transform_src'].get('auto_invert_mask', None)}"
             )
 
             if out_dir and save_if_needed:
@@ -1389,12 +1703,14 @@ def main():
                 print(f"[INFO] pair-id={dbg['sid']} idx_v={dbg['idx_v']} idx_i={dbg['idx_i']}")
                 print("[INFO] veh_fov:", dbg["veh_fov"])
                 print("[INFO] inf_fov:", dbg["inf_fov"])
+                print("[INFO] gt_src veh:", dbg.get("veh_gt_src"), "inf:", dbg.get("inf_gt_src"))
                 print("[INFO] transform src:", dbg["transform_src"])
                 print("[INFO] veh reduced path:", dbg.get("veh_reduced_path"))
                 print("[INFO] veh full path   :", dbg.get("veh_full_path"))
                 print("[INFO] inf reduced path:", dbg.get("inf_reduced_path"))
                 print("[INFO] inf full path   :", dbg.get("inf_full_path"))
                 print("[INFO] only_veh:", dbg.get("only_veh"), "only_inf:", dbg.get("only_inf"))
+                print("[INFO] use_native_gt:", dbg.get("use_native_gt"))
             return False
 
         vis.register_key_callback(ord("N"), cb_next)
@@ -1431,6 +1747,7 @@ def main():
         debug_print=bool(args.debug_print),
         only_veh=bool(args.only_veh),
         only_inf=bool(args.only_inf),
+        use_native_gt=use_native_gt,
     )
 
     vis = o3d.visualization.Visualizer()

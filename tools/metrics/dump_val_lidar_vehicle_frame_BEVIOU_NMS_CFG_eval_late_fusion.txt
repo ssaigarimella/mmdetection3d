@@ -1,0 +1,27 @@
+[INFO] dump_pkl: work_dirs/lidar_late_fusion_baseline/dump_val_lidar_vehicle_frame_BEVIOU_NMS_CFG.pkl
+[INFO] run_tag: late_fusion
+[INFO] timestamp: 2026-01-12 17:29:55
+[INFO] num_samples: 599
+[INFO] classes: ['Pedestrian', 'Cyclist', 'Car']
+[INFO] Dump contains FOV filter settings:
+  - az_margin_deg: 0.25
+  - azimuth_pcts: (0.5, 99.5)
+  - box_test: center
+  - el_margin_deg: 0.25
+  - elevation_pcts: (0.5, 99.5)
+  - filter_fused_by_veh_fov: True
+  - filter_gt: True
+  - filter_pred: True
+  - min_pts_for_fov: 64
+  - note: All filtering uses VEHICLE pipeline FOV to match dump_pred_gt_lidar.py.
+  - use_percentiles: True
+
+=== STRICT ===
+Pedestrian IoU=0.50 | BEV AP11=46.1557 AP40=47.4712 | 3D AP11=41.2259 AP40=39.6970
+Cyclist: no GT
+Car IoU=0.70 | BEV AP11=25.1138 AP40=22.9102 | 3D AP11=13.7466 AP40=11.9877
+
+=== LOOSE ===
+Pedestrian IoU=0.25 | BEV AP11=65.8732 AP40=66.8686 | 3D AP11=64.4431 AP40=64.1179
+Cyclist: no GT
+Car IoU=0.50 | BEV AP11=33.7415 AP40=32.2672 | 3D AP11=29.9193 AP40=28.6859

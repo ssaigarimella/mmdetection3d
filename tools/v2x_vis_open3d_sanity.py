@@ -46,7 +46,7 @@ NON_KITTI_ROOT = Path(
     "/home/dellg16ssg/multi-robot-coordination/collaborative-perception-BEVP/datasets/dair_v2x_synth_FULL"
 )
 
-SAMPLE_ID = "000000"
+SAMPLE_ID = "000031"
 SPLIT = "training"  # "training" or "testing"
 
 # Open3D visualization tuning

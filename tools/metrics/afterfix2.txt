@@ -1,0 +1,64 @@
+STRICT | BEV AP (IoU threshold shown per class)
++ ----------- + ---------- + ---- + ----- + ----- + ------------------------------------------------- +
+| run_tag     | class      | IoU  | AP11  | AP40  | source_file                                       |
++ =========== + ========== + ==== + ===== + ===== + ================================================= +
+| vehicle     | Car        | 0.70 | 38.21 | 39.56 | dump_val_lidar_PAIRED_eval_vehicle.txt            |
+| vehicle     | Pedestrian | 0.50 | 62.72 | 61.78 | dump_val_lidar_PAIRED_eval_vehicle.txt            |
+| vehicle     | Car        | 0.70 | 41.43 | 38.82 | dump_val_lidar_eval_vehicle.txt                   |
+| vehicle     | Pedestrian | 0.50 | 63.55 | 63.11 | dump_val_lidar_eval_vehicle.txt                   |
+| infra       | Car        | 0.70 | 38.65 | 37.41 | dump_val_lidar_PAIRED_eval_infra.txt              |
+| infra       | Pedestrian | 0.50 | 40.27 | 35.49 | dump_val_lidar_PAIRED_eval_infra.txt              |
+| infra       | Car        | 0.70 | 38.21 | 35.32 | dump_val_lidar_eval_infra.txt                     |
+| infra       | Pedestrian | 0.50 | 32.63 | 30.72 | dump_val_lidar_eval_infra.txt                     |
+| late_fusion | Car        | 0.70 | 26.03 | 24.30 | dump_val_lidar_vehicle_frame_eval_late_fusion.txt |
+| late_fusion | Pedestrian | 0.50 | 44.62 | 45.54 | dump_val_lidar_vehicle_frame_eval_late_fusion.txt |
++ ----------- + ---------- + ---- + ----- + ----- + ------------------------------------------------- +
+
+STRICT | 3D AP (IoU threshold shown per class)
++ ----------- + ---------- + ---- + ----- + ----- + ------------------------------------------------- +
+| run_tag     | class      | IoU  | AP11  | AP40  | source_file                                       |
++ =========== + ========== + ==== + ===== + ===== + ================================================= +
+| vehicle     | Car        | 0.70 | 28.80 | 28.10 | dump_val_lidar_PAIRED_eval_vehicle.txt            |
+| vehicle     | Pedestrian | 0.50 | 53.68 | 57.66 | dump_val_lidar_PAIRED_eval_vehicle.txt            |
+| vehicle     | Car        | 0.70 | 26.64 | 24.56 | dump_val_lidar_eval_vehicle.txt                   |
+| vehicle     | Pedestrian | 0.50 | 53.59 | 55.85 | dump_val_lidar_eval_vehicle.txt                   |
+| infra       | Car        | 0.70 | 7.71  | 7.21  | dump_val_lidar_PAIRED_eval_infra.txt              |
+| infra       | Pedestrian | 0.50 | 17.87 | 19.56 | dump_val_lidar_PAIRED_eval_infra.txt              |
+| infra       | Car        | 0.70 | 10.21 | 6.82  | dump_val_lidar_eval_infra.txt                     |
+| infra       | Pedestrian | 0.50 | 17.32 | 15.80 | dump_val_lidar_eval_infra.txt                     |
+| late_fusion | Car        | 0.70 | 12.73 | 10.68 | dump_val_lidar_vehicle_frame_eval_late_fusion.txt |
+| late_fusion | Pedestrian | 0.50 | 35.85 | 35.54 | dump_val_lidar_vehicle_frame_eval_late_fusion.txt |
++ ----------- + ---------- + ---- + ----- + ----- + ------------------------------------------------- +
+
+LOOSE | BEV AP (IoU threshold shown per class)
++ ----------- + ---------- + ---- + ----- + ----- + ------------------------------------------------- +
+| run_tag     | class      | IoU  | AP11  | AP40  | source_file                                       |
++ =========== + ========== + ==== + ===== + ===== + ================================================= +
+| vehicle     | Car        | 0.50 | 63.79 | 63.58 | dump_val_lidar_PAIRED_eval_vehicle.txt            |
+| vehicle     | Pedestrian | 0.25 | 66.10 | 70.39 | dump_val_lidar_PAIRED_eval_vehicle.txt            |
+| vehicle     | Car        | 0.50 | 63.06 | 62.73 | dump_val_lidar_eval_vehicle.txt                   |
+| vehicle     | Pedestrian | 0.25 | 79.85 | 82.85 | dump_val_lidar_eval_vehicle.txt                   |
+| infra       | Car        | 0.50 | 61.92 | 58.58 | dump_val_lidar_PAIRED_eval_infra.txt              |
+| infra       | Pedestrian | 0.25 | 45.45 | 47.50 | dump_val_lidar_PAIRED_eval_infra.txt              |
+| infra       | Car        | 0.50 | 53.08 | 55.66 | dump_val_lidar_eval_infra.txt                     |
+| infra       | Pedestrian | 0.25 | 45.23 | 39.78 | dump_val_lidar_eval_infra.txt                     |
+| late_fusion | Car        | 0.50 | 37.09 | 37.13 | dump_val_lidar_vehicle_frame_eval_late_fusion.txt |
+| late_fusion | Pedestrian | 0.25 | 72.67 | 72.01 | dump_val_lidar_vehicle_frame_eval_late_fusion.txt |
++ ----------- + ---------- + ---- + ----- + ----- + ------------------------------------------------- +
+
+LOOSE | 3D AP (IoU threshold shown per class)
++ ----------- + ---------- + ---- + ----- + ----- + ------------------------------------------------- +
+| run_tag     | class      | IoU  | AP11  | AP40  | source_file                                       |
++ =========== + ========== + ==== + ===== + ===== + ================================================= +
+| vehicle     | Car        | 0.50 | 56.55 | 58.43 | dump_val_lidar_PAIRED_eval_vehicle.txt            |
+| vehicle     | Pedestrian | 0.25 | 66.10 | 70.39 | dump_val_lidar_PAIRED_eval_vehicle.txt            |
+| vehicle     | Car        | 0.50 | 54.65 | 55.00 | dump_val_lidar_eval_vehicle.txt                   |
+| vehicle     | Pedestrian | 0.25 | 79.78 | 80.43 | dump_val_lidar_eval_vehicle.txt                   |
+| infra       | Car        | 0.50 | 51.86 | 51.94 | dump_val_lidar_PAIRED_eval_infra.txt              |
+| infra       | Pedestrian | 0.25 | 45.45 | 47.50 | dump_val_lidar_PAIRED_eval_infra.txt              |
+| infra       | Car        | 0.50 | 51.65 | 51.82 | dump_val_lidar_eval_infra.txt                     |
+| infra       | Pedestrian | 0.25 | 36.26 | 39.75 | dump_val_lidar_eval_infra.txt                     |
+| late_fusion | Car        | 0.50 | 31.90 | 31.35 | dump_val_lidar_vehicle_frame_eval_late_fusion.txt |
+| late_fusion | Pedestrian | 0.25 | 66.06 | 68.98 | dump_val_lidar_vehicle_frame_eval_late_fusion.txt |
++ ----------- + ---------- + ---- + ----- + ----- + ------------------------------------------------- +
+(mmdet3d_pp) dellg16ssg@dellg16ssg:~/mmdetection3d$ 
