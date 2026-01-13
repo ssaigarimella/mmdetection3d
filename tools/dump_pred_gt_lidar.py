@@ -18,13 +18,7 @@ Output is a pickle with:
     "samples": [
       {
         "sample_id": "000002",
-        "fov": {
-          "az0": float,          # radians, circular mean direction used for unwrap
-          "daz_min": float,      # radians (relative to az0)
-          "daz_max": float,      # radians (relative to az0)
-          "el_min": float,       # radians
-          "el_max": float,       # radians
-        },
+        "fov": {...} or None,
 
         "pred_boxes": (N,7) float32 [x,y,z,dx,dy,dz,yaw]   # after optional FOV filter
         "pred_scores": (N,) float32
@@ -42,6 +36,7 @@ Usage:
 """
 
 import argparse
+import re
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -85,15 +80,70 @@ MIN_PTS_FOR_FOV = 64
 # ============================================================
 
 
-def norm_sample_id(x: Any) -> str:
+def norm_sample_id(x: Any) -> Optional[str]:
+    """
+    Robustly normalize a sample id to a 6-digit string when possible.
+
+    Priority:
+    - If x is int-like: zero-pad to 6
+    - If x is a path-like string: use Path(x).stem
+    - If stem is digits: zero-pad to 6
+    - Else try to find a 6-digit substring anywhere
+    """
     if x is None:
-        return "000000"
+        return None
     if isinstance(x, (int, np.integer)):
         return f"{int(x):06d}"
+
     s = str(x).strip()
-    if s.isdigit():
-        return s.zfill(6) if len(s) <= 6 else s
-    return s
+    if not s:
+        return None
+
+    try:
+        stem = Path(s).stem
+    except Exception:
+        stem = s
+
+    if stem.isdigit():
+        return stem.zfill(6) if len(stem) <= 6 else stem
+
+    m = re.search(r"(\d{6})", stem)
+    if m:
+        return m.group(1)
+    m = re.search(r"(\d{6})", s)
+    if m:
+        return m.group(1)
+
+    return None
+
+
+def extract_pair_id_from_info(info: Dict) -> Optional[str]:
+    """
+    Extract an id that matches late-fusion pairing, preferably from lidar filename stem.
+
+    Tries, in order:
+    - info["lidar_points"]["lidar_path"], info["lidar_points"]["pts_path"]
+    - info["lidar_path"]
+    - info["sample_id"], info["sample_idx"]
+    """
+    if not isinstance(info, dict):
+        return None
+
+    lp = info.get("lidar_points", {})
+    cand = []
+    if isinstance(lp, dict):
+        cand.append(lp.get("lidar_path"))
+        cand.append(lp.get("pts_path"))
+
+    cand.append(info.get("lidar_path"))
+    cand.append(info.get("sample_id"))
+    cand.append(info.get("sample_idx"))
+
+    for x in cand:
+        sid = norm_sample_id(x)
+        if sid is not None:
+            return sid
+    return None
 
 
 def ensure_full_init(dataset) -> None:
@@ -250,7 +300,6 @@ def compute_fov_from_points(pts_xyz: np.ndarray) -> Optional[Dict[str, float]]:
     az = np.arctan2(y, x)
     el = np.arctan2(z, np.maximum(r_xy, 1e-12))
 
-    # circular mean for az
     az0 = float(np.arctan2(np.mean(np.sin(az)), np.mean(np.cos(az))))
     daz = wrap_to_pi(az - az0)
 
@@ -263,7 +312,6 @@ def compute_fov_from_points(pts_xyz: np.ndarray) -> Optional[Dict[str, float]]:
         el_min = float(np.min(el))
         el_max = float(np.max(el))
 
-    # margins
     daz_margin = np.deg2rad(float(AZ_MARGIN_DEG))
     el_margin = np.deg2rad(float(EL_MARGIN_DEG))
 
@@ -284,7 +332,7 @@ def boxes7_to_corners_xyz(boxes7: np.ndarray) -> np.ndarray:
     if boxes7.shape[0] == 0:
         return np.zeros((0, 8, 3), dtype=np.float32)
 
-    c = boxes7[:, 0:3].astype(np.float32)  # (N,3)
+    c = boxes7[:, 0:3].astype(np.float32)
     dx = boxes7[:, 3].astype(np.float32)
     dy = boxes7[:, 4].astype(np.float32)
     dz = boxes7[:, 5].astype(np.float32)
@@ -294,8 +342,6 @@ def boxes7_to_corners_xyz(boxes7: np.ndarray) -> np.ndarray:
     hy = 0.5 * dy
     hz = 0.5 * dz
 
-    # 8 corners in local box frame
-    # order doesn't matter for our "any corner inside" test
     corners_local = np.array(
         [
             [+1, +1, +1],
@@ -308,11 +354,9 @@ def boxes7_to_corners_xyz(boxes7: np.ndarray) -> np.ndarray:
             [-1, +1, -1],
         ],
         dtype=np.float32,
-    )  # (8,3)
+    )
 
-    corners = corners_local[None, :, :].copy()  # (1,8,3)
-    corners = np.repeat(corners, boxes7.shape[0], axis=0)  # (N,8,3)
-
+    corners = np.repeat(corners_local[None, :, :], boxes7.shape[0], axis=0)
     corners[:, :, 0] *= hx[:, None]
     corners[:, :, 1] *= hy[:, None]
     corners[:, :, 2] *= hz[:, None]
@@ -320,13 +364,11 @@ def boxes7_to_corners_xyz(boxes7: np.ndarray) -> np.ndarray:
     cy = np.cos(yaw)
     sy = np.sin(yaw)
 
-    # rotate XY
     x0 = corners[:, :, 0].copy()
     y0 = corners[:, :, 1].copy()
     corners[:, :, 0] = cy[:, None] * x0 - sy[:, None] * y0
     corners[:, :, 1] = sy[:, None] * x0 + cy[:, None] * y0
 
-    # translate
     corners[:, :, 0] += c[:, None, 0]
     corners[:, :, 1] += c[:, None, 1]
     corners[:, :, 2] += c[:, None, 2]
@@ -335,10 +377,6 @@ def boxes7_to_corners_xyz(boxes7: np.ndarray) -> np.ndarray:
 
 
 def in_fov_points_xyz(pts_xyz: np.ndarray, fov: Dict[str, float]) -> np.ndarray:
-    """
-    pts_xyz: (...,3)
-    returns mask (...)
-    """
     x = pts_xyz[..., 0]
     y = pts_xyz[..., 1]
     z = pts_xyz[..., 2]
@@ -360,7 +398,7 @@ def filter_boxes_by_fov(boxes7: np.ndarray, labels: np.ndarray, fov: Optional[Di
         centers = boxes7[:, 0:3].astype(np.float64)
         keep = in_fov_points_xyz(centers, fov)
     elif FOV_BOX_TEST == "any_corner":
-        corners = boxes7_to_corners_xyz(boxes7).astype(np.float64)  # (N,8,3)
+        corners = boxes7_to_corners_xyz(boxes7).astype(np.float64)
         keep = np.any(in_fov_points_xyz(corners, fov), axis=1)
     else:
         raise ValueError(f"Unknown FOV_BOX_TEST={FOV_BOX_TEST}")
@@ -425,12 +463,15 @@ def main():
     samples_out = []
     for idx in range(n):
         info = get_data_info(dataset, idx)
-        sid = norm_sample_id(info.get("sample_idx", idx))
+
+        # FIX: use lidar filename stem (same basis as late-fusion pairing), not dataset index
+        sid = extract_pair_id_from_info(info)
+        if sid is None:
+            sid = f"{idx:06d}"
 
         data = dataset[idx]
         data_batch = pseudo_collate([data])
 
-        # pipeline points => FOV
         pts_pipeline = extract_points_from_batch(data_batch)
         fov = compute_fov_from_points(pts_pipeline)
 
@@ -441,7 +482,6 @@ def main():
         pb, ps, pl = extract_pred(pred_sample, min_score=float(args.min_score))
         gb, gl = extract_gt_from_eval_ann_info(info)
 
-        # Apply FOV filtering (pure angles) if enabled and fov is available
         if FILTER_GT_BY_PIPELINE_FOV:
             gb, gl = filter_boxes_by_fov(gb, gl, fov)
 
@@ -460,13 +500,16 @@ def main():
             )
         )
 
-        if args.debug_every and (idx % int(args.debug_every) == 0) and fov is not None:
-            print(
-                f"[DEBUG] idx={idx} sid={sid} "
-                f"az0={fov['az0']:.3f} daz=[{fov['daz_min']:.3f},{fov['daz_max']:.3f}] "
-                f"el=[{fov['el_min']:.3f},{fov['el_max']:.3f}] "
-                f"GT={gb.shape[0]} Pred={pb.shape[0]}"
-            )
+        if args.debug_every and (idx % int(args.debug_every) == 0):
+            if fov is None:
+                print(f"[DEBUG] idx={idx} sid={sid} fov=None GT={gb.shape[0]} Pred={pb.shape[0]}")
+            else:
+                print(
+                    f"[DEBUG] idx={idx} sid={sid} "
+                    f"az0={fov['az0']:.3f} daz=[{fov['daz_min']:.3f},{fov['daz_max']:.3f}] "
+                    f"el=[{fov['el_min']:.3f},{fov['el_max']:.3f}] "
+                    f"GT={gb.shape[0]} Pred={pb.shape[0]}"
+                )
 
         if (idx + 1) % 50 == 0 or idx == n - 1:
             print(f"[INFO] dumped {idx+1}/{n}")
