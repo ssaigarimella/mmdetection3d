@@ -23,6 +23,10 @@ So we write BOTH naming styles:
   pred_boxes + pred_boxes_3d
   pred_scores + pred_scores_3d
   pred_labels + pred_labels_3d
+
+Additionally:
+  - Optional UNION GT de-duplication to avoid double-counting objects present in both sides' GT.
+  - Stores per-side GT boxes/labels (box7) in debug for auditing.
 """
 
 import argparse
@@ -123,6 +127,121 @@ def cornersN_to_box7N(corners_Nx8x3: np.ndarray) -> np.ndarray:
     for i in range(corners_Nx8x3.shape[0]):
         out[i] = corners_to_box7(corners_Nx8x3[i])
     return out
+
+
+def boxes7_to_bev5(boxes7: np.ndarray) -> np.ndarray:
+    """
+    (x,y,z,dx,dy,dz,yaw) -> (cx,cy,w,h,angle) for mmcv.ops.box_iou_rotated
+    """
+    b7 = np.asarray(boxes7, np.float32).reshape(-1, 7)
+    out = np.zeros((b7.shape[0], 5), np.float32)
+    out[:, 0] = b7[:, 0]
+    out[:, 1] = b7[:, 1]
+    out[:, 2] = b7[:, 3]
+    out[:, 3] = b7[:, 4]
+    out[:, 4] = b7[:, 6]
+    return out
+
+
+def bev_iou_rotated_mmcv(a7: np.ndarray, b7: np.ndarray, device: str) -> np.ndarray:
+    """
+    Returns IoU matrix (Na, Nb) in BEV for rotated boxes.
+    """
+    try:
+        from mmcv.ops import box_iou_rotated
+    except Exception as e:
+        raise RuntimeError("mmcv.ops.box_iou_rotated not available in this env.") from e
+
+    if a7.shape[0] == 0 or b7.shape[0] == 0:
+        return np.zeros((a7.shape[0], b7.shape[0]), dtype=np.float32)
+
+    a5 = torch.from_numpy(boxes7_to_bev5(a7)).to(device=device, dtype=torch.float32)
+    b5 = torch.from_numpy(boxes7_to_bev5(b7)).to(device=device, dtype=torch.float32)
+    iou = box_iou_rotated(a5, b5).detach().cpu().numpy().astype(np.float32)
+    return iou
+
+
+def dedup_union_gt_keep_vehicle(
+    gt_v_box7: np.ndarray,
+    gt_v_lbl: np.ndarray,
+    gt_i_box7: np.ndarray,
+    gt_i_lbl: np.ndarray,
+    device: str,
+    center_dist_thr: float = 1.5,
+    bev_iou_thr: float = 0.70,
+) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+    """
+    Removes infra GT boxes that duplicate vehicle GT boxes (same class, close centers, high BEV IoU).
+    Keeps vehicle GT always, drops only infra duplicates.
+
+    Returns:
+      union_box7, union_lbl, stats
+    """
+    gt_v_box7 = np.asarray(gt_v_box7, np.float32).reshape(-1, 7)
+    gt_i_box7 = np.asarray(gt_i_box7, np.float32).reshape(-1, 7)
+    gt_v_lbl = np.asarray(gt_v_lbl, np.int64).reshape(-1)
+    gt_i_lbl = np.asarray(gt_i_lbl, np.int64).reshape(-1)
+
+    keep_i = np.ones((gt_i_box7.shape[0],), dtype=bool)
+
+    dup_pairs = 0
+    dup_per_class: Dict[int, int] = {}
+
+    classes = np.unique(np.concatenate([gt_v_lbl, gt_i_lbl], axis=0)) if (gt_v_lbl.size + gt_i_lbl.size) else []
+
+    for cls in classes:
+        iv = np.where(gt_v_lbl == cls)[0]
+        ii = np.where(gt_i_lbl == cls)[0]
+        if iv.size == 0 or ii.size == 0:
+            continue
+
+        Vb = gt_v_box7[iv]
+        Ib = gt_i_box7[ii]
+
+        Vc = Vb[:, 0:3]
+        Ic = Ib[:, 0:3]
+        dist = np.linalg.norm(Vc[:, None, :] - Ic[None, :, :], axis=2)  # (Nv, Ni)
+
+        iou = bev_iou_rotated_mmcv(Vb, Ib, device=device)  # (Nv, Ni)
+
+        cand = (dist <= float(center_dist_thr)) & (iou >= float(bev_iou_thr))
+        if not np.any(cand):
+            continue
+
+        # Greedy match by highest IoU (one-to-one)
+        cand_idx = np.argwhere(cand)
+        scores = iou[cand_idx[:, 0], cand_idx[:, 1]]
+        order = np.argsort(-scores)
+
+        used_v = np.zeros((iv.size,), dtype=bool)
+        used_i = np.zeros((ii.size,), dtype=bool)
+
+        for k in order:
+            rv, ri = cand_idx[k]
+            if used_v[rv] or used_i[ri]:
+                continue
+            used_v[rv] = True
+            used_i[ri] = True
+            # Drop this infra GT (duplicate of a vehicle GT)
+            keep_i[ii[ri]] = False
+            dup_pairs += 1
+            dup_per_class[int(cls)] = dup_per_class.get(int(cls), 0) + 1
+
+    union_box7 = np.concatenate([gt_v_box7, gt_i_box7[keep_i]], axis=0) if (gt_v_box7.shape[0] + keep_i.sum()) else np.zeros((0, 7), np.float32)
+    union_lbl = np.concatenate([gt_v_lbl, gt_i_lbl[keep_i]], axis=0) if (gt_v_lbl.size + keep_i.sum()) else np.zeros((0,), np.int64)
+
+    stats = {
+        "dedup_enabled": True,
+        "dedup_center_dist_thr": float(center_dist_thr),
+        "dedup_bev_iou_thr": float(bev_iou_thr),
+        "dup_pairs": int(dup_pairs),
+        "dup_pairs_per_class": dup_per_class,
+        "veh_gt": int(gt_v_box7.shape[0]),
+        "inf_gt": int(gt_i_box7.shape[0]),
+        "inf_gt_kept": int(keep_i.sum()),
+        "union_gt_after": int(union_box7.shape[0]),
+    }
+    return union_box7, union_lbl, stats
 
 
 # -------------------------
@@ -289,6 +408,12 @@ def main() -> None:
     parser.add_argument("--max-samples", default=0, type=int)
     parser.add_argument("--run-eval", action="store_true")
 
+    # UNION GT de-dup (prevents double-counting of the same physical object)
+    parser.add_argument("--dedup-union-gt", action="store_true",
+                        help="If set, drop infra GT boxes that duplicate vehicle GT boxes (same class, close, high BEV IoU).")
+    parser.add_argument("--dedup-center-dist-thr", type=float, default=1.5)
+    parser.add_argument("--dedup-bev-iou-thr", type=float, default=0.70)
+
     args = parser.parse_args()
 
     if (args.only_veh + args.only_inf + args.only_late_fusion) > 1:
@@ -336,8 +461,7 @@ def main() -> None:
     if not (args.only_veh or args.only_inf):
         dump_paths["lf"] = outdir / f"dump_{args.tag}_late_fusion.pkl"
 
-    # Keep class list consistent with your TYPE_TO_LABEL mapping in the vis script.
-    # Also matches eval_lidar_ap_from_dump.py (classes.index -> cls_id):
+    # Must match eval_lidar_ap_from_dump.py (classes.index -> cls_id):
     classes = ["Car", "Pedestrian", "Cyclist"]
 
     dumps: Dict[str, Dict[str, Any]] = {}
@@ -366,6 +490,9 @@ def main() -> None:
                     "MATCH_DIST_M": float(getattr(V, "MATCH_DIST_M", 2.0)),
                     "FUSE_POLICY": str(getattr(V, "FUSE_POLICY", "pick_best")),
                     "LABEL_REMAP": "model{2:Car,0:Ped,1:Cyc} -> canonical{0:Car,1:Ped,2:Cyc}",
+                    "DEDUP_UNION_GT": bool(args.dedup_union_gt),
+                    "DEDUP_CENTER_DIST_THR": float(args.dedup_center_dist_thr),
+                    "DEDUP_BEV_IOU_THR": float(args.dedup_bev_iou_thr),
                 },
             },
             "samples": [],
@@ -376,9 +503,12 @@ def main() -> None:
     print(f"[INFO] vehicle split len={len(dataset_v)}, infra split len={len(dataset_i)}")
     print(f"[INFO] common pair-ids={len(common_ids)} (processing this many)")
     print(f"[INFO] use_native_gt={use_native_gt} (disable with --no-native-gt)")
+    print(f"[INFO] dedup_union_gt={bool(args.dedup_union_gt)}")
     print(f"[INFO] writing dumps under: {outdir}")
     for name, p in dump_paths.items():
         print(f"[INFO] will write {name}: {p}")
+
+    total_dup_pairs = 0
 
     for it, sid in enumerate(common_ids):
         idx_v = id2idx_v[sid]
@@ -416,7 +546,7 @@ def main() -> None:
             )
             T_cache[sid] = (T_veh_from_inf, src)
 
-        # UNION GT in vehicle frame
+        # Per-side GT in vehicle frame
         gt_v_c = out_v["gt_corners"]
         gt_v_l = out_v["gt_labels"].astype(np.int64) if out_v["gt_labels"] is not None else np.zeros((0,), dtype=np.int64)
 
@@ -434,12 +564,25 @@ def main() -> None:
             )
             gt_i_l = gt_i_l[keep_gti]
 
-        union_gt_c = np.concatenate([gt_v_c, gt_i_c_v], axis=0) \
-            if (gt_v_c.shape[0] + gt_i_c_v.shape[0]) > 0 else np.zeros((0, 8, 3), dtype=np.float64)
-        union_gt_l = np.concatenate([gt_v_l, gt_i_l], axis=0) \
-            if (gt_v_l.size + gt_i_l.size) > 0 else np.zeros((0,), dtype=np.int64)
+        gt_v_box7 = cornersN_to_box7N(gt_v_c).astype(np.float32)
+        gt_i_box7 = cornersN_to_box7N(gt_i_c_v).astype(np.float32)
 
-        union_gt_box7 = cornersN_to_box7N(union_gt_c)
+        # UNION GT with optional de-dup (keep vehicle GT, drop infra duplicates)
+        if args.dedup_union_gt and (gt_v_box7.shape[0] > 0) and (gt_i_box7.shape[0] > 0):
+            union_gt_box7, union_gt_l, dedup_stats = dedup_union_gt_keep_vehicle(
+                gt_v_box7=gt_v_box7,
+                gt_v_lbl=gt_v_l,
+                gt_i_box7=gt_i_box7,
+                gt_i_lbl=gt_i_l,
+                device=str(args.device),
+                center_dist_thr=float(args.dedup_center_dist_thr),
+                bev_iou_thr=float(args.dedup_bev_iou_thr),
+            )
+            total_dup_pairs += int(dedup_stats.get("dup_pairs", 0))
+        else:
+            union_gt_box7 = np.concatenate([gt_v_box7, gt_i_box7], axis=0) if (gt_v_box7.shape[0] + gt_i_box7.shape[0]) else np.zeros((0, 7), np.float32)
+            union_gt_l = np.concatenate([gt_v_l, gt_i_l], axis=0) if (gt_v_l.size + gt_i_l.size) else np.zeros((0,), np.int64)
+            dedup_stats = {"dedup_enabled": False}
 
         # Vehicle preds
         veh_pred_c = out_v["pred_corners"]
@@ -470,23 +613,22 @@ def main() -> None:
             )
             inf_pred_s = inf_pred_s[keep_infp]
             inf_pred_l = inf_pred_l[keep_infp]
+            inf_pred_l_raw = inf_pred_l_raw[keep_infp]
 
         inf_pred_box7 = cornersN_to_box7N(inf_pred_c_v)
 
-        # Late fusion
+        # Late fusion (class grouping uses raw model labels, then remap to canonical)
         fused_c, fused_cent, fused_s, fused_l_raw = fuse_preds_with_labels(
             veh_corners=veh_pred_c,
             veh_centers=out_v["pred_centers"],
             veh_scores=veh_pred_s,
-            veh_labels=veh_pred_l_raw,  # fusion class grouping uses raw model labels
+            veh_labels=veh_pred_l_raw,
             inf_corners_v=inf_pred_c_v,
             inf_centers_v=inf_pred_c_v.mean(axis=1) if inf_pred_c_v.shape[0] > 0 else out_i["pred_centers"],
             inf_scores=inf_pred_s,
-            inf_labels=inf_pred_l_raw,  # fusion class grouping uses raw model labels
+            inf_labels=inf_pred_l_raw,
             match_dist_m=float(getattr(V, "MATCH_DIST_M", 2.0)),
         )
-
-        # Now remap fused labels to canonical for evaluation
         fused_l = remap_model_labels_to_canonical(fused_l_raw)
 
         if bool(getattr(V, "FILTER_FUSED_BY_VEH_FOV", True)) and fused_c.shape[0] > 0:
@@ -509,7 +651,8 @@ def main() -> None:
                 f"[DBG] sid={sid} "
                 f"veh_raw={np.unique(veh_pred_l_raw).tolist()} veh={np.unique(veh_pred_l).tolist()} | "
                 f"inf_raw={np.unique(inf_pred_l_raw).tolist()} inf={np.unique(inf_pred_l).tolist()} | "
-                f"fused_raw={np.unique(fused_l_raw).tolist()} fused={np.unique(fused_l).tolist()}"
+                f"fused_raw={np.unique(fused_l_raw).tolist()} fused={np.unique(fused_l).tolist()} | "
+                f"dedup={dedup_stats}"
             )
 
         base_record = {
@@ -526,13 +669,20 @@ def main() -> None:
             "debug": {
                 "idx_v": int(idx_v),
                 "idx_i": int(idx_i),
-                "veh_gt_count": int(gt_v_c.shape[0]),
-                "inf_gt_count": int(gt_i_c_v.shape[0]),
+                "veh_gt_count": int(gt_v_box7.shape[0]),
+                "inf_gt_count": int(gt_i_box7.shape[0]),
                 "union_gt_count": int(union_gt_box7.shape[0]),
                 "veh_pred_count": int(veh_pred_box7.shape[0]),
                 "inf_pred_count": int(inf_pred_box7.shape[0]),
                 "fused_pred_count": int(fused_box7.shape[0]),
                 "transform_src": src,
+                "dedup_stats": dedup_stats,
+
+                # Audit fields (small but very useful)
+                "gt_vehicle_boxes7": gt_v_box7,
+                "gt_vehicle_labels": gt_v_l,
+                "gt_infra_boxes7_in_vehicle": gt_i_box7,
+                "gt_infra_labels": gt_i_l,
             },
         }
 
@@ -576,6 +726,9 @@ def main() -> None:
     for name, path in dump_paths.items():
         save_dump(path, dumps[name])
         print(f"[INFO] wrote: {path}  (samples={len(dumps[name]['samples'])})")
+
+    if args.dedup_union_gt:
+        print(f"[INFO] total dedup duplicate pairs dropped (infra GT): {total_dup_pairs}")
 
     if args.run_eval:
         repo_root = Path.cwd()
