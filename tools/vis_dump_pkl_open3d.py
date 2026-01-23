@@ -58,13 +58,27 @@ BEV_MARGIN_M = 5.0
 BEV_FIXED_HALF_RANGE: Optional[float] = None
 
 # -------- Open3D 3D cosmetics --------
-# Thick "line" edges are drawn as cylinders with this radius (meters).
-# Increase to make box edges thicker in 3D.
-O3D_EDGE_RADIUS = 0.1         # try 0.02 .. 0.10
+O3D_EDGE_RADIUS = 0.1          # thickness in meters
 O3D_EDGE_RESOLUTION = 12       # cylinder quality; lower if too slow
+O3D_COORD_FRAME_SIZE = 4.0
 
-# Coordinate frame size in Open3D
-O3D_COORD_FRAME_SIZE = 2.0
+# -------- Open3D camera focus (THIS controls how zoomed-in it is) --------
+O3D_AUTO_FOCUS_ON_REDRAW = True
+
+# Padding added around the box AABB before framing (meters). Smaller = tighter.
+O3D_FOCUS_PADDING_M = 0.25
+
+# Distance from camera to lookat, relative to the box AABB diagonal.
+# Smaller => more zoomed-in. Try 0.35 .. 0.80
+O3D_CAM_DIST_SCALE = 0.45
+
+# Hard minimum distance so the camera doesn't go inside the box cluster (meters)
+O3D_CAM_DIST_MIN_M = 3.0
+
+# Camera orientation (in your LiDAR frame)
+O3D_CAM_UP = (0.0, 0.0, 1.0)
+# "front" is direction from camera toward the lookat point.
+O3D_CAM_FRONT = (1.0, 0.0, -0.35)
 
 
 # ============================================================
@@ -80,12 +94,6 @@ def load_dump(path: Path) -> Dict:
 
 
 def bev_rect_corners_xy(box7: np.ndarray) -> np.ndarray:
-    """
-    Orthogonal BEV projection of a 3D box onto XY plane: rotated rectangle.
-
-    box7: [x, y, z, dx, dy, dz, yaw] in LiDAR/vehicle frame
-    Returns (4,2) corners in order around the rectangle.
-    """
     x, y, _, dx, dy, _, yaw = [float(v) for v in box7]
     hx, hy = 0.5 * dx, 0.5 * dy
 
@@ -139,7 +147,7 @@ def print_help():
     print("  B : previous sample (wrap)")
     print("  S : save screenshot to --out-dir")
     print("  H : print help + current status")
-    print("  Q / ESC : quit")
+    print("  Q / ESC: quit")
 
 
 # ============================================================
@@ -186,7 +194,7 @@ def run_matplotlib_bev_viewer(
             r = 20.0
             return (-r, r, -r, r)
 
-        P = np.concatenate(pts, axis=0)  # (N,2)
+        P = np.concatenate(pts, axis=0)
         xmin, ymin = P.min(axis=0)
         xmax, ymax = P.max(axis=0)
         xmin -= BEV_MARGIN_M
@@ -194,7 +202,6 @@ def run_matplotlib_bev_viewer(
         ymin -= BEV_MARGIN_M
         ymax += BEV_MARGIN_M
 
-        # keep square view
         cx = 0.5 * (xmin + xmax)
         cy = 0.5 * (ymin + ymax)
         half = 0.5 * max((xmax - xmin), (ymax - ymin))
@@ -252,11 +259,7 @@ def run_matplotlib_bev_viewer(
         pb, _ps = filter_and_cap_preds(pred_boxes, pred_scores, score_thr, max_preds)
 
         ax.clear()
-
-        if BEV_SHOW_GRID:
-            ax.grid(True, linewidth=0.6)
-        else:
-            ax.grid(False)
+        ax.grid(bool(BEV_SHOW_GRID), linewidth=0.6)
 
         if BEV_SHOW_AXES:
             _draw_vehicle_axes()
@@ -287,7 +290,6 @@ def run_matplotlib_bev_viewer(
             ax.set_ylabel("Y (vehicle frame)")
 
         _apply_axis_visibility()
-
         fig.canvas.draw_idle()
 
         if out_dir and save:
@@ -333,7 +335,7 @@ def run_matplotlib_bev_viewer(
 
 
 # ============================================================
-# Open3D 3D viewer (thick edges via cylinders)
+# Open3D 3D viewer (thick edges via cylinders) + deterministic camera distance
 # ============================================================
 
 def run_open3d_3d_viewer(
@@ -461,6 +463,100 @@ def run_open3d_3d_viewer(
             m += _cylinder_between(corners[i0], corners[i1], radius, color_rgb)
         return m
 
+    def _aabb_of_geoms(geoms: List["o3d.geometry.Geometry"]) -> Optional["o3d.geometry.AxisAlignedBoundingBox"]:
+        aabb = None
+        for g in geoms:
+            try:
+                bb = g.get_axis_aligned_bounding_box()
+                aabb = bb if aabb is None else (aabb + bb)
+            except Exception:
+                continue
+        return aabb
+
+    def _normalize(v: np.ndarray) -> np.ndarray:
+        v = np.asarray(v, dtype=np.float64).reshape(3)
+        n = float(np.linalg.norm(v))
+        if n < 1e-12:
+            return np.array([1.0, 0.0, -0.35], dtype=np.float64)
+        return v / n
+
+    def _lookat_extrinsic(eye: np.ndarray, lookat: np.ndarray, up: np.ndarray) -> np.ndarray:
+        """
+        Return Open3D pinhole extrinsic (world -> camera) using a standard look-at.
+        """
+        eye = np.asarray(eye, dtype=np.float64).reshape(3)
+        lookat = np.asarray(lookat, dtype=np.float64).reshape(3)
+        up = np.asarray(up, dtype=np.float64).reshape(3)
+
+        f = lookat - eye
+        f = _normalize(f)
+        upn = _normalize(up)
+
+        s = np.cross(f, upn)
+        s = _normalize(s)
+        u = np.cross(s, f)  # already normalized
+
+        # World->Cam (view) matrix:
+        # [ s^T ; u^T ; -f^T ] * [X - eye]
+        M = np.eye(4, dtype=np.float64)
+        M[0, 0:3] = s
+        M[1, 0:3] = u
+        M[2, 0:3] = -f
+        M[0, 3] = -float(np.dot(s, eye))
+        M[1, 3] = -float(np.dot(u, eye))
+        M[2, 3] = float(np.dot(f, eye))
+        return M
+
+    def _focus_camera_on_boxes(
+        vis: "o3d.visualization.VisualizerWithKeyCallback",
+        box_geoms: List["o3d.geometry.Geometry"],
+        fallback_geoms: List["o3d.geometry.Geometry"],
+    ) -> None:
+        vc = vis.get_view_control()
+        if vc is None:
+            return
+
+        aabb = _aabb_of_geoms(box_geoms) if len(box_geoms) > 0 else _aabb_of_geoms(fallback_geoms)
+        if aabb is None:
+            return
+
+        minb = np.asarray(aabb.min_bound, dtype=np.float64)
+        maxb = np.asarray(aabb.max_bound, dtype=np.float64)
+
+        pad = float(O3D_FOCUS_PADDING_M)
+        minb = minb - pad
+        maxb = maxb + pad
+
+        center = 0.5 * (minb + maxb)
+        extent = (maxb - minb)
+        diag = float(np.linalg.norm(extent))
+        if diag < 1e-6:
+            diag = 10.0
+
+        front = _normalize(np.array(O3D_CAM_FRONT, dtype=np.float64))
+        up = _normalize(np.array(O3D_CAM_UP, dtype=np.float64))
+
+        # Deterministic distance (THIS is the zoom).
+        dist = max(float(O3D_CAM_DIST_MIN_M), float(O3D_CAM_DIST_SCALE) * diag)
+        eye = center - front * dist
+
+        # Take current intrinsics, only replace extrinsic.
+        try:
+            pin = vc.convert_to_pinhole_camera_parameters()
+            pin.extrinsic = _lookat_extrinsic(eye, center, up)
+            try:
+                vc.convert_from_pinhole_camera_parameters(pin, allow_arbitrary=True)
+            except TypeError:
+                vc.convert_from_pinhole_camera_parameters(pin)
+        except Exception:
+            # Fallback: if pinhole conversion fails, at least set lookat/front/up.
+            try:
+                vc.set_lookat(center.tolist())
+                vc.set_front(front.tolist())
+                vc.set_up(up.tolist())
+            except Exception:
+                pass
+
     n = len(samples)
     if n == 0:
         raise RuntimeError("Dump has zero samples.")
@@ -488,12 +584,12 @@ def run_open3d_3d_viewer(
 
         pb, _ps = filter_and_cap_preds(pred_boxes, pred_scores, score_thr, max_preds)
 
-        geoms: List["o3d.geometry.Geometry"] = []
-        geoms.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(O3D_COORD_FRAME_SIZE), origin=[0, 0, 0]))
+        coord = o3d.geometry.TriangleMesh.create_coordinate_frame(size=float(O3D_COORD_FRAME_SIZE), origin=[0, 0, 0])
 
+        box_geoms: List["o3d.geometry.Geometry"] = []
         if show_gt and gt_boxes.shape[0] > 0:
             for k in range(gt_boxes.shape[0]):
-                geoms.append(
+                box_geoms.append(
                     corners_to_thick_edges_mesh(
                         make_corners_from_box7_3d(gt_boxes[k]),
                         (0.2, 1.0, 0.2),
@@ -503,7 +599,7 @@ def run_open3d_3d_viewer(
 
         if show_pred and pb.shape[0] > 0:
             for k in range(pb.shape[0]):
-                geoms.append(
+                box_geoms.append(
                     corners_to_thick_edges_mesh(
                         make_corners_from_box7_3d(pb[k]),
                         (1.0, 0.2, 0.2),
@@ -511,9 +607,26 @@ def run_open3d_3d_viewer(
                     )
                 )
 
+        geoms: List["o3d.geometry.Geometry"] = [coord] + box_geoms
+
         vis.clear_geometries()
-        for g in geoms:
-            vis.add_geometry(g)
+        for gi, g in enumerate(geoms):
+            try:
+                vis.add_geometry(g, reset_bounding_box=(gi == 0))
+            except TypeError:
+                vis.add_geometry(g)
+
+        vis.poll_events()
+        vis.update_renderer()
+
+        # Important: reset internal bounds first, then apply our deterministic camera.
+        try:
+            vis.reset_view_point(True)
+        except Exception:
+            pass
+
+        if O3D_AUTO_FOCUS_ON_REDRAW:
+            _focus_camera_on_boxes(vis, box_geoms=box_geoms, fallback_geoms=geoms)
 
         vis.poll_events()
         vis.update_renderer()
@@ -548,11 +661,17 @@ def run_open3d_3d_viewer(
 
     def cb_help(v):
         print_help()
-        print(f"[INFO] current idx={state['idx']} | edge_radius={O3D_EDGE_RADIUS}")
+        print(
+            f"[INFO] current idx={state['idx']} | edge_radius={O3D_EDGE_RADIUS} | "
+            f"pad={O3D_FOCUS_PADDING_M} | dist_scale={O3D_CAM_DIST_SCALE} | dist_min={O3D_CAM_DIST_MIN_M}"
+        )
         return False
 
     def cb_quit(v):
-        vis.close()
+        try:
+            vis.close()
+        except Exception:
+            pass
         return False
 
     vis.register_key_callback(ord("N"), cb_next)
@@ -560,7 +679,11 @@ def run_open3d_3d_viewer(
     vis.register_key_callback(ord("S"), cb_save)
     vis.register_key_callback(ord("H"), cb_help)
     vis.register_key_callback(ord("Q"), cb_quit)
-    vis.register_key_callback(256, cb_quit)  # ESC (best-effort; may vary by backend)
+
+    try:
+        vis.register_key_callback(256, cb_quit)  # ESC best-effort
+    except Exception:
+        pass
 
     redraw(state["idx"], save=False)
     vis.run()
