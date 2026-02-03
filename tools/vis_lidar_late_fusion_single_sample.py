@@ -86,6 +86,18 @@ TRY_SET_LINE_WIDTH = True
 LINE_WIDTH_FALLBACK = 6.0
 
 # -------------------------
+# OPEN3D CAMERA FOCUS
+# -------------------------
+O3D_AUTO_FOCUS_ON_REDRAW = True
+O3D_FOCUS_PADDING_M = 0.25
+O3D_CAM_DIST_SCALE = 0.04
+O3D_CAM_DIST_MIN_M = 0.1
+O3D_CAM_UP = (0.0, 0.0, 1.0)
+O3D_CAM_FRONT = (1.0, 0.0, -0.35)
+O3D_CAM_ZOOM = 0.05
+O3D_FOCUS_KEEP_PERCENTILE = 90.0
+
+# -------------------------
 # PREDICTION Z FIX
 # -------------------------
 # Symptom you reported: pred centers are exactly +1x box height above GT centers.
@@ -134,6 +146,8 @@ FUSE_POLICY = "pick_best"  # when matched, pick the higher-score box
 # ============================================================
 
 USE_NATIVE_LIDAR_GT = True
+NATIVE_LIDAR_LABEL_SUBDIR = "lidar"  # set to "auto" to use lidar/virtuallidar by side
+NATIVE_GT_Z_IS_BOTTOM = False  # if True, convert z from bottom to center
 
 TYPE_TO_LABEL = {
     "Car": 0,
@@ -167,6 +181,8 @@ def print_legend() -> None:
     print(f"  USE_THICK_BOX_EDGES={USE_THICK_BOX_EDGES} BOX_EDGE_RADIUS_M={BOX_EDGE_RADIUS_M}")
     print("[GT SOURCE]")
     print(f"  USE_NATIVE_LIDAR_GT={USE_NATIVE_LIDAR_GT}")
+    print(f"  NATIVE_LIDAR_LABEL_SUBDIR={NATIVE_LIDAR_LABEL_SUBDIR}")
+    print(f"  NATIVE_GT_Z_IS_BOTTOM={NATIVE_GT_Z_IS_BOTTOM}")
     print("[PRED Z FIX]")
     print(f"  FIX_PRED_Z_BY_OWN_HEIGHT={FIX_PRED_Z_BY_OWN_HEIGHT} PRED_Z_HEIGHT_FACTOR={PRED_Z_HEIGHT_FACTOR}")
 
@@ -471,7 +487,40 @@ def pred_from_output(pred_sample, score_thr: float) -> Tuple[np.ndarray, np.ndar
     return corners_kept, centers_kept, scores_kept, labels_kept
 
 
-def gt_from_eval_ann_info(dataset, idx: int) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _get_dataset_classes(dataset) -> Optional[List[str]]:
+    if hasattr(dataset, "metainfo") and isinstance(getattr(dataset, "metainfo"), dict):
+        classes = dataset.metainfo.get("classes", None)
+        if isinstance(classes, (list, tuple)):
+            return [str(c) for c in classes]
+    if hasattr(dataset, "CLASSES"):
+        classes = getattr(dataset, "CLASSES")
+        if isinstance(classes, (list, tuple)):
+            return [str(c) for c in classes]
+    return None
+
+def _canonical_label_from_name(name: str) -> int:
+    key = str(name).strip().lower()
+    if key in ("car", "vehicle", "truck", "bus", "van"):
+        return 0
+    if key in ("pedestrian", "person"):
+        return 1
+    if key in ("cyclist", "bicycle", "bike", "motorcycle", "motorcyclist"):
+        return 2
+    return 0
+
+def remap_labels_to_canonical_by_names(labels: np.ndarray, classes: Optional[List[str]]) -> np.ndarray:
+    if labels is None:
+        return np.zeros((0,), dtype=np.int64)
+    lbl = np.asarray(labels, dtype=np.int64).copy()
+    if classes is None or len(classes) == 0:
+        return lbl
+    out = lbl.copy()
+    for src_id, name in enumerate(classes):
+        dst_id = _canonical_label_from_name(name)
+        out[lbl == int(src_id)] = int(dst_id)
+    return out
+
+def gt_from_eval_ann_info(dataset, idx: int, remap_to_canonical: bool = False) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     ensure_full_init(dataset)
     info = _get_data_info(dataset, idx)
     if not isinstance(info, dict):
@@ -498,6 +547,9 @@ def gt_from_eval_ann_info(dataset, idx: int) -> Tuple[np.ndarray, np.ndarray, np
         labels = np.zeros((corners.shape[0],), dtype=np.int64)
     else:
         labels = gt_labels.detach().cpu().numpy().astype(np.int64) if not isinstance(gt_labels, np.ndarray) else gt_labels.astype(np.int64)
+    if remap_to_canonical:
+        classes = _get_dataset_classes(dataset)
+        labels = remap_labels_to_canonical_by_names(labels, classes)
     return corners, centers, labels
 
 
@@ -527,14 +579,21 @@ def get_coop_root(non_kitti_root: Path) -> Path:
         return cand
     return non_kitti_root
 
+def _native_label_subdir_for_side(side: str) -> str:
+    if str(NATIVE_LIDAR_LABEL_SUBDIR).lower() == "auto":
+        return "virtuallidar" if side == "infrastructure-side" else "lidar"
+    return str(NATIVE_LIDAR_LABEL_SUBDIR)
+
 def load_native_lidar_labels(coop_root: Path, side: str, sample_id: str) -> List[Dict]:
     if side not in ("vehicle-side", "infrastructure-side"):
         raise ValueError("side must be 'vehicle-side' or 'infrastructure-side'")
 
-    p = coop_root / side / "label" / "lidar" / f"{sample_id}.json"
+    subdir = _native_label_subdir_for_side(side)
+    p = coop_root / side / "label" / subdir / f"{sample_id}.json"
     if not p.is_file():
         hits = sorted(coop_root.rglob(f"{sample_id}.json"))
-        hits = [h for h in hits if ("/label/lidar/" in h.as_posix().lower()) and (side in h.as_posix())]
+        subdir_pat = f"/label/{subdir}/"
+        hits = [h for h in hits if (subdir_pat in h.as_posix().lower()) and (side in h.as_posix())]
         if not hits:
             raise FileNotFoundError(f"Missing native lidar label json for {side} id={sample_id} under {coop_root}")
         p = hits[0]
@@ -557,8 +616,9 @@ def load_native_lidar_labels(coop_root: Path, side: str, sample_id: str) -> List
         cz = _as_float(loc.get("z"), 0.0)
 
         # If your native lidar labels store z at a different origin (bottom/top),
-        # you must normalize cz here. In this script we assume your GT is already correct.
-        # Example bottom->center would be: cz = cz + 0.5 * h
+        # normalize cz here.
+        if NATIVE_GT_Z_IS_BOTTOM:
+            cz = cz + 0.5 * h
 
         yaw = _as_float(g.get("rotation", g.get("yaw", 0.0)), 0.0)
 
@@ -908,6 +968,7 @@ def compute_T_veh_from_inf_from_json(
     veh_pts_reduced: np.ndarray,
     inf_pts_reduced: np.ndarray,
     debug_print: bool = False,
+    force_mask: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[np.ndarray, Dict[str, Any]]:
     """
     Robustly compute T_veh_from_inf by trying inversion combinations for the
@@ -934,6 +995,26 @@ def compute_T_veh_from_inf_from_json(
         "mask": (0, 0, 0),
         "T_veh_from_inf": np.eye(4, dtype=np.float64),
     }
+
+    if force_mask is not None:
+        m1, m2, m3 = [int(x) for x in force_mask]
+        T_world_from_veh_novatel = inv_T(T1_raw) if m1 else T1_raw
+        T_veh_novatel_from_veh_lidar = inv_T(T2_raw) if m2 else T2_raw
+        T_world_from_inf_lidar = inv_T(T3_raw) if m3 else T3_raw
+
+        T_world_from_veh_lidar = T_world_from_veh_novatel @ T_veh_novatel_from_veh_lidar
+        T_veh_from_world = inv_T(T_world_from_veh_lidar)
+        T_veh_from_inf = T_veh_from_world @ T_world_from_inf_lidar
+
+        src = {
+            "veh_novatel_to_world": str(veh_novatel_to_world_json),
+            "veh_lidar_to_novatel": str(veh_lidar_to_novatel_json),
+            "inf_lidar_to_world": str(inf_lidar_to_world_json),
+            "auto_invert_mask": {"invert_T1": bool(m1), "invert_T2": bool(m2), "invert_T3": bool(m3)},
+            "auto_score_median_nn_m": None,
+            "note": "forced inversion mask (no auto-selection)",
+        }
+        return T_veh_from_inf, src
 
     for m1 in (0, 1):
         for m2 in (0, 1):
@@ -1087,6 +1168,79 @@ def fuse_preds(
 # Open3D box rendering (THICK EDGES)
 # -------------------------
 
+def _normalize(v: np.ndarray) -> np.ndarray:
+    n = float(np.linalg.norm(v))
+    if n < 1e-12:
+        return v
+    return v / n
+
+def _lookat_extrinsic(eye: np.ndarray, lookat: np.ndarray, up: np.ndarray) -> np.ndarray:
+    eye = np.asarray(eye, dtype=np.float64).reshape(3)
+    lookat = np.asarray(lookat, dtype=np.float64).reshape(3)
+    up = np.asarray(up, dtype=np.float64).reshape(3)
+    f = _normalize(lookat - eye)
+    upn = _normalize(up)
+    s = np.cross(f, upn)
+    if np.linalg.norm(s) < 1e-8:
+        s = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    s = _normalize(s)
+    u = np.cross(s, f)
+    M = np.eye(4, dtype=np.float64)
+    M[0, :3] = s
+    M[1, :3] = u
+    M[2, :3] = -f
+    M[:3, 3] = -M[:3, :3] @ eye
+    return M
+
+def _focus_camera_on_box_corners(vis, corners_list: List[np.ndarray]) -> None:
+    if not corners_list:
+        return
+    corners_arr = [c.reshape(-1, 3) for c in corners_list]
+    if len(corners_arr) == 0:
+        return
+    pts = np.concatenate(corners_arr, axis=0)
+    if len(corners_arr) > 1:
+        centers = np.stack([c.mean(axis=0) for c in corners_arr], axis=0)
+        med = np.median(centers, axis=0)
+        d = np.linalg.norm(centers - med, axis=1)
+        if np.isfinite(d).all():
+            try:
+                keep_thr = float(np.percentile(d, float(O3D_FOCUS_KEEP_PERCENTILE)))
+                keep_thr = max(keep_thr, 1e-6)
+                keep = d <= keep_thr
+                if np.any(keep):
+                    pts = np.concatenate([corners_arr[i] for i in range(len(corners_arr)) if keep[i]], axis=0)
+            except Exception:
+                pass
+    minb = pts.min(axis=0)
+    maxb = pts.max(axis=0)
+    center = 0.5 * (minb + maxb)
+    diag = float(np.linalg.norm(maxb - minb))
+    pad = float(O3D_FOCUS_PADDING_M)
+    diag = max(diag + 2.0 * pad, 1e-3)
+    front = _normalize(np.array(O3D_CAM_FRONT, dtype=np.float64))
+    up = _normalize(np.array(O3D_CAM_UP, dtype=np.float64))
+    dist = max(float(O3D_CAM_DIST_MIN_M), float(O3D_CAM_DIST_SCALE) * diag)
+    vc = vis.get_view_control()
+    if vc is None:
+        return
+    try:
+        eye = center - front * dist
+        pin = vc.convert_to_pinhole_camera_parameters()
+        pin.extrinsic = _lookat_extrinsic(eye, center, up)
+        vc.convert_from_pinhole_camera_parameters(pin, allow_arbitrary=True)
+        if hasattr(vc, "set_zoom"):
+            vc.set_zoom(float(O3D_CAM_ZOOM))
+    except Exception:
+        try:
+            vc.set_lookat(center.tolist())
+            vc.set_front(front.tolist())
+            vc.set_up(up.tolist())
+            if hasattr(vc, "set_zoom"):
+                vc.set_zoom(float(O3D_CAM_ZOOM))
+        except Exception:
+            pass
+
 _BOX_EDGES = np.array(
     [
         [0, 1], [1, 2], [2, 3], [3, 0],
@@ -1168,14 +1322,17 @@ def corners_to_thick_box_mesh(corners_8x3: np.ndarray, color_rgb, radius: float,
     out.compute_vertex_normals()
     return out
 
-def add_box_geom(geoms: List[o3d.geometry.Geometry], corners_8x3: np.ndarray, color_rgb) -> None:
+def add_box_geom(geoms: List[o3d.geometry.Geometry], corners_8x3: np.ndarray, color_rgb) -> o3d.geometry.Geometry:
     if USE_THICK_BOX_EDGES:
         try:
-            geoms.append(corners_to_thick_box_mesh(corners_8x3, color_rgb, BOX_EDGE_RADIUS_M, BOX_EDGE_CYL_RES))
-            return
+            g = corners_to_thick_box_mesh(corners_8x3, color_rgb, BOX_EDGE_RADIUS_M, BOX_EDGE_CYL_RES)
+            geoms.append(g)
+            return g
         except Exception:
             pass
-    geoms.append(corners_to_lineset(corners_8x3, color_rgb))
+    g = corners_to_lineset(corners_8x3, color_rgb)
+    geoms.append(g)
+    return g
 
 
 # -------------------------
@@ -1230,12 +1387,12 @@ def run_one_side(
             gt_corners, gt_centers, gt_labels = gt_from_native_lidar_labels(
                 coop_root=coop_root, side=side_name, sid=sid
             )
-            gt_src = f"native:{side_name}/label/lidar"
+            gt_src = f"native:{side_name}/label/{_native_label_subdir_for_side(side_name)}"
         except Exception:
-            gt_corners, gt_centers, gt_labels = gt_from_eval_ann_info(dataset, idx)
+            gt_corners, gt_centers, gt_labels = gt_from_eval_ann_info(dataset, idx, remap_to_canonical=True)
             gt_src = "eval_ann_info (native missing)"
     else:
-        gt_corners, gt_centers, gt_labels = gt_from_eval_ann_info(dataset, idx)
+        gt_corners, gt_centers, gt_labels = gt_from_eval_ann_info(dataset, idx, remap_to_canonical=True)
 
     pred_corners, pred_centers, pred_scores, pred_labels = pred_from_output(pred_sample, score_thr=score_thr)
 
@@ -1315,6 +1472,7 @@ def build_scene_for_sid(
     only_veh: bool,
     only_inf: bool,
     use_native_gt: bool,
+    force_transform_mask: Optional[Tuple[int, int, int]] = None,
 ) -> Tuple[List[o3d.geometry.Geometry], Dict[str, Any]]:
     idx_v = id2idx_v[sid]
     idx_i = id2idx_i[sid]
@@ -1348,14 +1506,25 @@ def build_scene_for_sid(
             veh_pts_reduced=out_v["pts_reduced_pipeline"],
             inf_pts_reduced=out_i["pts_reduced_pipeline"],
             debug_print=debug_print,
+            force_mask=force_transform_mask,
         )
         T_cache[sid] = (T_veh_from_inf, src)
+
+    # Alignment score for this transform (lower is better)
+    try:
+        inf_pts_v = apply_T_points(T_veh_from_inf, out_i["pts_reduced_pipeline"])
+        nn_m = _nn_score(out_v["pts_reduced_pipeline"], inf_pts_v, max_pairs=12000)
+    except Exception:
+        nn_m = None
 
     draw_veh_pred = (not only_inf)
     draw_inf_pred = (not only_veh)
     draw_fused = (not (only_veh or only_inf))
 
     geoms: List[o3d.geometry.Geometry] = []
+    box_geoms: List[o3d.geometry.Geometry] = []
+    box_corners: List[np.ndarray] = []
+    pred_corners: List[np.ndarray] = []
     geoms.append(o3d.geometry.TriangleMesh.create_coordinate_frame(size=2.0, origin=[0, 0, 0]))
 
     if show_veh_full and out_v["pts_full_vis"] is not None and out_v["pts_full_vis"].shape[0] > 0:
@@ -1386,7 +1555,8 @@ def build_scene_for_sid(
 
     # GT boxes
     for k in range(out_v["gt_corners"].shape[0]):
-        add_box_geom(geoms, out_v["gt_corners"][k], GT_VEH_COLOR)
+        box_geoms.append(add_box_geom(geoms, out_v["gt_corners"][k], GT_VEH_COLOR))
+        box_corners.append(out_v["gt_corners"][k])
 
     inf_gt_corners_v = apply_T_corners(T_veh_from_inf, out_i["gt_corners"])
     inf_gt_centers_v = inf_gt_corners_v.mean(axis=1) if inf_gt_corners_v.shape[0] > 0 else out_i["gt_centers"]
@@ -1399,12 +1569,15 @@ def build_scene_for_sid(
             pts_pipeline_xyz=out_v["pts_reduced_pipeline"],
         )
     for k in range(inf_gt_corners_v.shape[0]):
-        add_box_geom(geoms, inf_gt_corners_v[k], GT_INF_COLOR)
+        box_geoms.append(add_box_geom(geoms, inf_gt_corners_v[k], GT_INF_COLOR))
+        box_corners.append(inf_gt_corners_v[k])
 
     # Predictions
     if draw_veh_pred:
         for k in range(out_v["pred_corners"].shape[0]):
-            add_box_geom(geoms, out_v["pred_corners"][k], PRED_VEH_COLOR)
+            box_geoms.append(add_box_geom(geoms, out_v["pred_corners"][k], PRED_VEH_COLOR))
+            box_corners.append(out_v["pred_corners"][k])
+            pred_corners.append(out_v["pred_corners"][k])
 
     inf_pred_corners_v = apply_T_corners(T_veh_from_inf, out_i["pred_corners"])
     inf_pred_centers_v = inf_pred_corners_v.mean(axis=1) if inf_pred_corners_v.shape[0] > 0 else out_i["pred_centers"]
@@ -1421,7 +1594,9 @@ def build_scene_for_sid(
 
     if draw_inf_pred:
         for k in range(inf_pred_corners_v.shape[0]):
-            add_box_geom(geoms, inf_pred_corners_v[k], PRED_INF_COLOR)
+            box_geoms.append(add_box_geom(geoms, inf_pred_corners_v[k], PRED_INF_COLOR))
+            box_corners.append(inf_pred_corners_v[k])
+            pred_corners.append(inf_pred_corners_v[k])
 
     # Fused
     if draw_fused:
@@ -1448,7 +1623,9 @@ def build_scene_for_sid(
             fused_scores = fused_scores[keep_fused]
 
         for k in range(fused_corners.shape[0]):
-            add_box_geom(geoms, fused_corners[k], PRED_FUSED_COLOR)
+            box_geoms.append(add_box_geom(geoms, fused_corners[k], PRED_FUSED_COLOR))
+            box_corners.append(fused_corners[k])
+            pred_corners.append(fused_corners[k])
         fused_pred_count = int(fused_corners.shape[0])
     else:
         fused_pred_count = 0
@@ -1467,6 +1644,7 @@ def build_scene_for_sid(
         "inf_pred": int(inf_pred_corners_v.shape[0]) if draw_inf_pred else 0,
         "fused_pred": fused_pred_count,
         "transform_src": src,
+        "nn_m": nn_m,
         "veh_reduced_path": out_v.get("reduced_path"),
         "veh_full_path": out_v.get("full_path"),
         "inf_reduced_path": out_i.get("reduced_path"),
@@ -1488,6 +1666,9 @@ def build_scene_for_sid(
         print("[DEBUG] inf full path   :", dbg["inf_full_path"])
         print(f"[DEBUG] counts: veh_gt={dbg['veh_gt']} inf_gt={dbg['inf_gt']} veh_pred={dbg['veh_pred']} inf_pred={dbg['inf_pred']} fused={dbg['fused_pred']}")
 
+    dbg["box_geoms"] = box_geoms
+    dbg["box_corners"] = box_corners
+    dbg["pred_corners"] = pred_corners
     return geoms, dbg
 
 
@@ -1497,6 +1678,7 @@ def print_help():
     print("  B : previous sample (wrap)")
     print("  S : save screenshot to --out-dir")
     print("  H : help + status + legend")
+    print("  R : refocus camera on boxes")
     print("  ESC / close window: exit")
 
 
@@ -1535,6 +1717,8 @@ def main():
     parser.add_argument("--veh-novatel-key", default="novatel_to_world", type=str)
     parser.add_argument("--veh-lidar2novatel-key", default="lidar_to_novatel", type=str)
     parser.add_argument("--inf-lidar2world-key", default="virtuallidar_to_world", type=str)
+    parser.add_argument("--force-transform-mask", default=None, type=str,
+                        help="Force inversion mask 'm1,m2,m3' (0/1). Overrides auto selection.")
 
     parser.add_argument("--show-veh-full", action="store_true", help="show vehicle FULL velodyne points (if found)")
     parser.add_argument("--hide-veh-reduced", action="store_true", help="hide vehicle REDUCED (pipeline) points")
@@ -1548,17 +1732,53 @@ def main():
     parser.add_argument("--only-inf", action="store_true", help="Render ONLY infra preds (still render union GT).")
 
     parser.add_argument("--no-native-gt", action="store_true", help="Disable native lidar GT; use eval_ann_info instead.")
+    parser.add_argument("--native-gt-subdir", default=None, type=str,
+                        help="Native GT subdir under label/ (e.g., lidar or virtuallidar).")
+    parser.add_argument("--native-gt-z-bottom", action="store_true",
+                        help="If set, treat native GT z as bottom and shift to center.")
+    parser.add_argument("--pred-z-fix", action="store_true", default=None,
+                        help="Enable prediction z-shift fix.")
+    parser.add_argument("--no-pred-z-fix", action="store_true", default=None,
+                        help="Disable prediction z-shift fix.")
+    parser.add_argument("--cam-zoom", type=float, default=None, help="Override Open3D camera zoom.")
+    parser.add_argument("--cam-dist-scale", type=float, default=None, help="Override camera distance scale.")
+    parser.add_argument("--cam-dist-min", type=float, default=None, help="Override camera minimum distance.")
 
     args = parser.parse_args()
+
+    force_mask = None
+    if args.force_transform_mask:
+        parts = [p.strip() for p in str(args.force_transform_mask).split(",") if p.strip()]
+        if len(parts) != 3:
+            raise ValueError("--force-transform-mask must be 'm1,m2,m3' with 3 values.")
+        force_mask = (int(parts[0]), int(parts[1]), int(parts[2]))
 
     if args.only_veh and args.only_inf:
         raise ValueError("Choose at most one of --only-veh or --only-inf.")
 
     global VEH_REDUCED_VOXELGRID_SIZE, INF_REDUCED_VOXELGRID_SIZE
+    global NATIVE_LIDAR_LABEL_SUBDIR, NATIVE_GT_Z_IS_BOTTOM
+    global FIX_PRED_Z_BY_OWN_HEIGHT
+    global O3D_CAM_ZOOM, O3D_CAM_DIST_SCALE, O3D_CAM_DIST_MIN_M
     if args.veh_reduced_cube is not None and args.veh_reduced_cube > 0:
         VEH_REDUCED_VOXELGRID_SIZE = float(args.veh_reduced_cube)
     if args.inf_reduced_cube is not None and args.inf_reduced_cube > 0:
         INF_REDUCED_VOXELGRID_SIZE = float(args.inf_reduced_cube)
+
+    if args.native_gt_subdir is not None:
+        NATIVE_LIDAR_LABEL_SUBDIR = str(args.native_gt_subdir).strip()
+    if args.native_gt_z_bottom:
+        NATIVE_GT_Z_IS_BOTTOM = True
+    if args.pred_z_fix is True:
+        FIX_PRED_Z_BY_OWN_HEIGHT = True
+    if args.no_pred_z_fix is True:
+        FIX_PRED_Z_BY_OWN_HEIGHT = False
+    if args.cam_zoom is not None:
+        O3D_CAM_ZOOM = float(args.cam_zoom)
+    if args.cam_dist_scale is not None:
+        O3D_CAM_DIST_SCALE = float(args.cam_dist_scale)
+    if args.cam_dist_min is not None:
+        O3D_CAM_DIST_MIN_M = float(args.cam_dist_min)
 
     register_all_modules(init_default_scope=True)
 
@@ -1654,6 +1874,7 @@ def main():
                 only_veh=bool(args.only_veh),
                 only_inf=bool(args.only_inf),
                 use_native_gt=use_native_gt,
+                force_transform_mask=force_mask,
             )
             state["last_dbg"] = dbg
 
@@ -1662,6 +1883,17 @@ def main():
                 vis.add_geometry(g)
             vis.poll_events()
             vis.update_renderer()
+            if O3D_AUTO_FOCUS_ON_REDRAW:
+                box_corners = None
+                if isinstance(dbg, dict):
+                    box_corners = dbg.get("pred_corners") or dbg.get("box_corners")
+                try:
+                    vis.reset_view_point(True)
+                except Exception:
+                    pass
+                if box_corners:
+                    _focus_camera_on_box_corners(vis, box_corners)
+                vis.update_renderer()
 
             print(
                 f"[INFO] pair-id={sid} | "
@@ -1669,6 +1901,7 @@ def main():
                 f"veh_pred={dbg['veh_pred']} inf_pred={dbg['inf_pred']} fused={dbg['fused_pred']} | "
                 f"gt_src veh={dbg.get('veh_gt_src')} inf={dbg.get('inf_gt_src')} | "
                 f"auto_nn_m={dbg['transform_src'].get('auto_score_median_nn_m', None)} "
+                f"nn_m={dbg.get('nn_m', None)} "
                 f"mask={dbg['transform_src'].get('auto_invert_mask', None)}"
             )
 
@@ -1713,10 +1946,21 @@ def main():
                 print("[INFO] use_native_gt:", dbg.get("use_native_gt"))
             return False
 
+        def cb_refocus(v):
+            dbg = state.get("last_dbg", None)
+            box_corners = None
+            if isinstance(dbg, dict):
+                box_corners = dbg.get("pred_corners") or dbg.get("box_corners")
+            if box_corners:
+                _focus_camera_on_box_corners(v, box_corners)
+            v.update_renderer()
+            return False
+
         vis.register_key_callback(ord("N"), cb_next)
         vis.register_key_callback(ord("B"), cb_prev)
         vis.register_key_callback(ord("S"), cb_save)
         vis.register_key_callback(ord("H"), cb_help)
+        vis.register_key_callback(ord("R"), cb_refocus)
 
         redraw(start_pos, save_if_needed=bool(out_dir))
         vis.run()
@@ -1748,6 +1992,7 @@ def main():
         only_veh=bool(args.only_veh),
         only_inf=bool(args.only_inf),
         use_native_gt=use_native_gt,
+        force_transform_mask=force_mask,
     )
 
     vis = o3d.visualization.Visualizer()

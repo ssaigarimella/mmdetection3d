@@ -40,7 +40,7 @@ train_pipeline = [
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=4,
-        use_dim=4,
+        use_dim=3,
         backend_args=backend_args),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     # dict(type='ObjectSample', db_sampler=db_sampler, use_ground_plane=True),
@@ -60,7 +60,7 @@ test_pipeline = [
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=4,
-        use_dim=4,
+        use_dim=3,
         backend_args=backend_args),
     dict(
         type='MultiScaleFlipAug3D',
@@ -183,6 +183,10 @@ model = dict(
         )
     ),
     voxel_encoder=dict(
+        in_channels=3,
+        with_cluster_center=True,
+        with_voxel_center=True,
+        with_distance=False,
         point_cloud_range=point_cloud_range,
         voxel_size=voxel_size,
     ),
@@ -191,6 +195,7 @@ model = dict(
     ),
     bbox_head=dict(
         anchor_generator=dict(
+            type='Anchor3DRangeGenerator',
             ranges=[
                 [point_cloud_range[0], point_cloud_range[1], -0.6,
                  point_cloud_range[3], point_cloud_range[4], -0.6],
@@ -199,6 +204,9 @@ model = dict(
                 [point_cloud_range[0], point_cloud_range[1], -1.78,
                  point_cloud_range[3], point_cloud_range[4], -1.78],
             ],
+            sizes=[[0.6, 0.8, 1.73], [0.6, 1.76, 1.73], [1.6, 3.9, 1.56]],
+            rotations=[0, 1.57],
+            reshape_out=False,
         )
     )
 )

@@ -3,6 +3,7 @@
 tools/v2x_vis_open3d_sanity.py
 
 Open3D sanity viewer for DAIR-V2X-style two-LiDAR setup (vehicle + infrastructure).
+This one is for reviewing just the dataset it does not include the predictions.
 
 What it visualizes (in VEHICLE LiDAR frame):
   - vehicle KITTI velodyne points (red)

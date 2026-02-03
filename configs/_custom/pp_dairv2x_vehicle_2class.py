@@ -5,26 +5,25 @@ _base_ = [
     '../_base_/default_runtime.py'
 ]
 
-# DAIR-V2X VIC3D (infrastructure-side) range
+# DAIR-V2X Vehicle-side range (same as synthetic)
 point_cloud_range = [0, -39.68, -3, 92.16, 39.68, 1]
 
-# dataset settings
-data_root = '/home/dellg16ssg/multi-robot-coordination/collaborative-perception-BEVP/datasets/DAIR-V2X-C/cooperative-vehicle-infrastructure/infrastructure-side/'
-class_names = ['Pedestrian', 'Cyclist', 'Car']
+# Dataset settings - 2 classes only (Car + Pedestrian)
+data_root = '/home/dellg16ssg/multi-robot-coordination/collaborative-perception-BEVP/datasets/DAIR-V2X-C/cooperative-vehicle-infrastructure/vehicle-side/'
+class_names = ['Pedestrian', 'Car']  # 2 classes only
 metainfo = dict(classes=class_names)
 backend_args = None
 
-# PointPillars adopted a different sampling strategies among classes
-# Keep as in your synth config for compatibility (can be tuned later)
+# PointPillars DB sampler (2 classes)
 db_sampler = dict(
     data_root=data_root,
     info_path=data_root + 'kitti_dbinfos_train.pkl',
     rate=1.0,
     prepare=dict(
         filter_by_difficulty=[-1],
-        filter_by_min_points=dict(Car=5, Pedestrian=5, Cyclist=5)),
+        filter_by_min_points=dict(Car=5, Pedestrian=5)),
     classes=class_names,
-    sample_groups=dict(Car=15, Pedestrian=15, Cyclist=15),
+    sample_groups=dict(Car=15, Pedestrian=15),
     points_loader=dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
@@ -34,16 +33,16 @@ db_sampler = dict(
     backend_args=backend_args
 )
 
-# PointPillars uses different augmentation hyper parameters
+# Training pipeline (same as synthetic)
 train_pipeline = [
     dict(
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=4,
-        use_dim=3,
+        use_dim=4,
         backend_args=backend_args),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
-    # dict(type='ObjectSample', db_sampler=db_sampler, use_ground_plane=True),
+    # dict(type='ObjectSample', db_sampler=db_sampler, use_ground_plane=True),  # DISABLED - no ground plane in DAIR-V2X
     dict(type='RandomFlip3D', flip_ratio_bev_horizontal=0.5),
     dict(
         type='GlobalRotScaleTrans',
@@ -60,7 +59,7 @@ test_pipeline = [
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=4,
-        use_dim=3,
+        use_dim=4,
         backend_args=backend_args),
     dict(
         type='MultiScaleFlipAug3D',
@@ -79,11 +78,12 @@ test_pipeline = [
     dict(type='Pack3DDetInputs', keys=['points'])
 ]
 
+# Dataloader configs
 train_dataloader = dict(dataset=dict(dataset=dict(pipeline=train_pipeline, metainfo=metainfo)))
 test_dataloader = dict(dataset=dict(pipeline=test_pipeline, metainfo=metainfo))
 val_dataloader = dict(dataset=dict(pipeline=test_pipeline, metainfo=metainfo))
 
-# optimizer/schedule (unchanged)
+# Optimizer/schedule (same as synthetic)
 lr = 0.001
 epoch_num = 80
 optim_wrapper = dict(
@@ -132,7 +132,7 @@ test_cfg = dict()
 # HARD OVERRIDE DATASET ROOTS
 # -------------------------
 
-INFRA_ROOT = data_root
+VEHICLE_ROOT = data_root
 
 def _patch_dataloader(dl, root, ann_file, pts_prefix='training/velodyne_reduced'):
     ds = dl['dataset']
@@ -149,19 +149,19 @@ def _patch_dataloader(dl, root, ann_file, pts_prefix='training/velodyne_reduced'
     ds['data_prefix']['pts'] = pts_prefix
     ds['metainfo'] = metainfo
 
-_patch_dataloader(train_dataloader, INFRA_ROOT, 'kitti_infos_train.pkl')
-_patch_dataloader(val_dataloader,   INFRA_ROOT, 'kitti_infos_val.pkl')
-_patch_dataloader(test_dataloader,  INFRA_ROOT, 'kitti_infos_val.pkl')
+_patch_dataloader(train_dataloader, VEHICLE_ROOT, 'kitti_infos_train.pkl')
+_patch_dataloader(val_dataloader,   VEHICLE_ROOT, 'kitti_infos_val.pkl')
+_patch_dataloader(test_dataloader,  VEHICLE_ROOT, 'kitti_infos_val.pkl')
 
 val_evaluator = dict(
     type='KittiMetric',
-    ann_file=INFRA_ROOT + 'kitti_infos_val.pkl',
+    ann_file=VEHICLE_ROOT + 'kitti_infos_val.pkl',
     metric='bbox'
 )
 
 test_evaluator = dict(
     type='KittiMetric',
-    ann_file=INFRA_ROOT + 'kitti_infos_val.pkl',
+    ann_file=VEHICLE_ROOT + 'kitti_infos_val.pkl',
     metric='bbox'
 )
 
@@ -183,7 +183,7 @@ model = dict(
         )
     ),
     voxel_encoder=dict(
-        in_channels=3,
+        in_channels=4,
         with_cluster_center=True,
         with_voxel_center=True,
         with_distance=False,
@@ -194,19 +194,38 @@ model = dict(
         output_shape=output_shape
     ),
     bbox_head=dict(
+        num_classes=2,  # 2 classes only
         anchor_generator=dict(
             type='Anchor3DRangeGenerator',
             ranges=[
                 [point_cloud_range[0], point_cloud_range[1], -0.6,
                  point_cloud_range[3], point_cloud_range[4], -0.6],
-                [point_cloud_range[0], point_cloud_range[1], -0.6,
-                 point_cloud_range[3], point_cloud_range[4], -0.6],
                 [point_cloud_range[0], point_cloud_range[1], -1.78,
                  point_cloud_range[3], point_cloud_range[4], -1.78],
             ],
-            sizes=[[0.6, 0.8, 1.73], [0.6, 1.76, 1.73], [1.6, 3.9, 1.56]],
+            sizes=[[0.6, 0.8, 1.73], [1.6, 3.9, 1.56]],  # Pedestrian, Car
             rotations=[0, 1.57],
             reshape_out=False,
         )
-    )
+    ),
+    train_cfg=dict(
+        assigner=[
+            dict(  # for Pedestrian
+                type='Max3DIoUAssigner',
+                iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+                pos_iou_thr=0.5,
+                neg_iou_thr=0.35,
+                min_pos_iou=0.35,
+                ignore_iof_thr=-1),
+            dict(  # for Car
+                type='Max3DIoUAssigner',
+                iou_calculator=dict(type='mmdet3d.BboxOverlapsNearest3D'),
+                pos_iou_thr=0.6,
+                neg_iou_thr=0.45,
+                min_pos_iou=0.45,
+                ignore_iof_thr=-1),
+        ],
+        allowed_border=0,
+        pos_weight=-1,
+        debug=False)
 )

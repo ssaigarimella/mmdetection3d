@@ -4,6 +4,7 @@ tools/vis_dump_pkl_open3d.py
 
 Visualize ONLY what is in dump_val_lidar.pkl produced by dump_pred_gt_lidar.py.
 No dataset loading, no calib, no transforms, no pointcloud file access.
+This one includes both the GT boxes and the predicted boxes.
 
 Modes:
 - 2D BEV (Matplotlib): draw BEV rectangles (orthogonal projection onto XY)
@@ -41,8 +42,8 @@ BEV_SHOW_LABELS = False        # title + axis labels + X/Y text
 BEV_SHOW_TICKS = False         # tick marks + tick labels
 
 # BEV plot cosmetics
-BEV_DARK_GT_COLOR = (0.0, 0.35, 0.0)   # dark green
-BEV_DARK_PR_COLOR = (0.55, 0.0, 0.0)   # dark red
+BEV_DARK_GT_COLOR = (0.0, 0.35, 0.0)   # dark green: GROUND TRUTH
+BEV_DARK_PR_COLOR = (0.55, 0.0, 0.0)   # dark red: PREDICTION
 BEV_LINEWIDTH_GT = 2.5
 BEV_LINEWIDTH_PR = 2.5
 BEV_AXES_LINEWIDTH = 2.0
@@ -91,6 +92,50 @@ def load_dump(path: Path) -> Dict:
     if not isinstance(d, dict) or "samples" not in d:
         raise RuntimeError("Unexpected dump format: expected dict with key 'samples'.")
     return d
+
+
+def _parse_class_list(s: Optional[str]) -> List[str]:
+    if s is None:
+        return []
+    parts = [p.strip() for p in s.split(",")]
+    return [p for p in parts if p]
+
+
+def _resolve_class_ids(names: List[str], classes: Optional[List[str]]) -> List[int]:
+    if not names:
+        return []
+    ids: List[int] = []
+    if classes is None:
+        # Allow numeric ids only if class list is unknown.
+        for n in names:
+            if n.isdigit():
+                ids.append(int(n))
+            else:
+                raise RuntimeError(f"Class name '{n}' provided but dump has no class list.")
+        return ids
+
+    name_to_id = {str(c).lower(): i for i, c in enumerate(classes)}
+    for n in names:
+        key = str(n).lower()
+        if key.isdigit():
+            ids.append(int(key))
+        elif key in name_to_id:
+            ids.append(int(name_to_id[key]))
+        else:
+            raise RuntimeError(f"Unknown class '{n}'. Available: {classes}")
+    return ids
+
+
+def _sample_has_any_gt_class(sample: Dict, class_ids: List[int]) -> bool:
+    if not class_ids:
+        return True
+    labels = sample.get("gt_labels", sample.get("gt_labels_3d", None))
+    if labels is None:
+        return False
+    arr = np.asarray(labels, dtype=np.int64).reshape(-1)
+    if arr.size == 0:
+        return False
+    return bool(np.isin(arr, np.asarray(class_ids, dtype=np.int64)).any())
 
 
 def bev_rect_corners_xy(box7: np.ndarray) -> np.ndarray:
@@ -280,12 +325,7 @@ def run_matplotlib_bev_viewer(
         sid = str(sample.get("sample_id", ""))
 
         if BEV_SHOW_LABELS:
-            pred_total = int(np.asarray(pred_boxes).shape[0]) if pred_boxes is not None else 0
-            ax.set_title(
-                f"BEV 2D | idx={i}/{n-1} sid={sid} | GT={gt_boxes.shape[0]} | "
-                f"Pred kept={pb.shape[0]}/{pred_total} | score_thr={score_thr}",
-                fontsize=12,
-            )
+            ax.set_title(f"BEV 2D | idx={i}/{n-1} sid={sid}", fontsize=12)
             ax.set_xlabel("X (vehicle frame)")
             ax.set_ylabel("Y (vehicle frame)")
 
@@ -298,11 +338,10 @@ def run_matplotlib_bev_viewer(
             fig.savefig(str(png), dpi=200, bbox_inches="tight", pad_inches=0.02)
             print(f"[INFO] Wrote screenshot: {png}")
 
-        pred_total = int(np.asarray(pred_boxes).shape[0]) if pred_boxes is not None else 0
-        print(
-            f"[INFO] idx={i}/{n-1} sid={sid} | GT={gt_boxes.shape[0]} | "
-            f"Pred kept={pb.shape[0]}/{pred_total} | score_thr={score_thr} | mode=BEV-2D"
-        )
+        # MOD: print only GT and prediction counts for this frame (from PKL content for the frame)
+        gt_count = int(gt_boxes.shape[0])
+        pred_count = int(pb.shape[0]) if show_pred else 0
+        print(f"[COUNT] idx={i}/{n-1} sid={sid} | GT={gt_count} | Pred={pred_count}")
 
     def on_key(event):
         k = (event.key or "").lower()
@@ -496,8 +535,6 @@ def run_open3d_3d_viewer(
         s = _normalize(s)
         u = np.cross(s, f)  # already normalized
 
-        # World->Cam (view) matrix:
-        # [ s^T ; u^T ; -f^T ] * [X - eye]
         M = np.eye(4, dtype=np.float64)
         M[0, 0:3] = s
         M[1, 0:3] = u
@@ -536,11 +573,9 @@ def run_open3d_3d_viewer(
         front = _normalize(np.array(O3D_CAM_FRONT, dtype=np.float64))
         up = _normalize(np.array(O3D_CAM_UP, dtype=np.float64))
 
-        # Deterministic distance (THIS is the zoom).
         dist = max(float(O3D_CAM_DIST_MIN_M), float(O3D_CAM_DIST_SCALE) * diag)
         eye = center - front * dist
 
-        # Take current intrinsics, only replace extrinsic.
         try:
             pin = vc.convert_to_pinhole_camera_parameters()
             pin.extrinsic = _lookat_extrinsic(eye, center, up)
@@ -549,7 +584,6 @@ def run_open3d_3d_viewer(
             except TypeError:
                 vc.convert_from_pinhole_camera_parameters(pin)
         except Exception:
-            # Fallback: if pinhole conversion fails, at least set lookat/front/up.
             try:
                 vc.set_lookat(center.tolist())
                 vc.set_front(front.tolist())
@@ -619,7 +653,6 @@ def run_open3d_3d_viewer(
         vis.poll_events()
         vis.update_renderer()
 
-        # Important: reset internal bounds first, then apply our deterministic camera.
         try:
             vis.reset_view_point(True)
         except Exception:
@@ -632,11 +665,11 @@ def run_open3d_3d_viewer(
         vis.update_renderer()
 
         sid = str(sample.get("sample_id", ""))
-        pred_total = int(np.asarray(pred_boxes).shape[0]) if pred_boxes is not None else 0
-        print(
-            f"[INFO] idx={i}/{n-1} sid={sid} | GT={gt_boxes.shape[0]} | "
-            f"Pred kept={pb.shape[0]}/{pred_total} | score_thr={score_thr} | mode=3D"
-        )
+
+        # MOD: print only GT and prediction counts for this frame (from PKL content for the frame)
+        gt_count = int(gt_boxes.shape[0])
+        pred_count = int(pb.shape[0]) if show_pred else 0
+        print(f"[COUNT] idx={i}/{n-1} sid={sid} | GT={gt_count} | Pred={pred_count}")
 
         if out_dir and save:
             sid_out = sid if sid else f"{i:06d}"
@@ -704,6 +737,12 @@ def main():
     ap.add_argument("--show-gt", action="store_true", help="Show GT boxes.")
     ap.add_argument("--show-pred", action="store_true", help="Show predicted boxes.")
     ap.add_argument("--max-preds", type=int, default=0, help="Cap drawn preds per sample (0 = no cap).")
+    ap.add_argument(
+        "--only-gt-class",
+        type=str,
+        default=None,
+        help="Comma-separated class names (or ids) to filter samples by GT labels (e.g., Pedestrian).",
+    )
     args = ap.parse_args()
 
     dump_path = Path(args.dump_pkl)
@@ -720,6 +759,16 @@ def main():
     show_pred = bool(args.show_pred) if (args.show_gt or args.show_pred) else True
 
     classes = d.get("classes", None)
+
+    only_gt_names = _parse_class_list(args.only_gt_class)
+    only_gt_ids = _resolve_class_ids(only_gt_names, classes)
+    if only_gt_ids:
+        before_n = len(samples)
+        samples = [s for s in samples if _sample_has_any_gt_class(s, only_gt_ids)]
+        after_n = len(samples)
+        if after_n == 0:
+            raise RuntimeError(f"No samples matched --only-gt-class={args.only_gt_class}")
+        print(f"[INFO] Filtered samples by GT class {only_gt_names} -> {after_n}/{before_n}")
 
     if USE_MATPLOTLIB_BEV_2D:
         run_matplotlib_bev_viewer(

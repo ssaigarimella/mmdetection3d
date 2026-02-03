@@ -209,15 +209,69 @@ def eval_set(name: str, classes, samples, thr_map, device: str):
     return lines
 
 
+def parse_range_buckets(spec: str):
+    if not spec:
+        return []
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" not in part:
+            raise ValueError(f"Bad range bucket: {part}")
+        a, b = part.split("-", 1)
+        out.append((float(a), float(b)))
+    return out
+
+
+def filter_samples_by_range(samples, r0: float, r1: float, axis: str = "radial"):
+    filt = []
+    for s in samples:
+        gt = np.asarray(s["gt_boxes"], dtype=np.float32).reshape(-1, 7)
+        pr = np.asarray(s["pred_boxes"], dtype=np.float32).reshape(-1, 7)
+
+        if axis == "x":
+            gt_d = gt[:, 0]
+            pr_d = pr[:, 0]
+        else:
+            gt_d = np.sqrt(gt[:, 0] ** 2 + gt[:, 1] ** 2)
+            pr_d = np.sqrt(pr[:, 0] ** 2 + pr[:, 1] ** 2)
+
+        gt_keep = (gt_d >= r0) & (gt_d < r1)
+        pr_keep = (pr_d >= r0) & (pr_d < r1)
+
+        s2 = dict(s)
+        s2["gt_boxes"] = gt[gt_keep]
+        s2["gt_labels"] = s["gt_labels"][gt_keep]
+        s2["pred_boxes"] = pr[pr_keep]
+        s2["pred_scores"] = s["pred_scores"][pr_keep]
+        s2["pred_labels"] = s["pred_labels"][pr_keep]
+        filt.append(s2)
+    return filt
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("dump_pkl", type=str)
     ap.add_argument("--device", type=str, default="cuda:0", help="Device for rotated IoU (mmcv op).")
+    ap.add_argument("--classes", nargs="+", default=None, help="Subset of classes to eval, e.g., Car Pedestrian")
+    ap.add_argument("--uniform-iou-thrs", default="", type=str,
+                    help="Comma list of IoU thresholds to apply to ALL classes, e.g. '0.7,0.5,0.25'. "
+                         "If set, overrides STRICT/LOOSE mixed IoUs.")
+    ap.add_argument("--range-buckets", default="", type=str,
+                    help="Comma list like '0-30,30-50,50-100'.")
+    ap.add_argument("--range-axis", default="radial", choices=["radial", "x"],
+                    help="Distance axis for range buckets.")
     args = ap.parse_args()
 
     dump_path = Path(args.dump_pkl)
     dump = pickle.load(open(dump_path, "rb"))
     classes = list(dump["classes"])
+    if args.classes:
+        wanted = [str(c) for c in args.classes]
+        classes = [c for c in classes if c in wanted]
+        if not classes:
+            raise ValueError(f"No matching classes in dump. dump classes={dump['classes']}, wanted={wanted}")
     samples = dump["samples"]
 
     run_tag = infer_run_tag_from_path(dump_path)
@@ -247,14 +301,45 @@ def main():
         if c not in thr_loose:
             thr_loose[c] = 0.25
 
-    strict_lines = eval_set("STRICT", classes, samples, thr_strict, device=args.device)
-    loose_lines = eval_set("LOOSE", classes, samples, thr_loose, device=args.device)
+    uniform_thrs: List[float] = []
+    if args.uniform_iou_thrs:
+        for part in str(args.uniform_iou_thrs).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            uniform_thrs.append(float(part))
+
+    buckets = parse_range_buckets(args.range_buckets)
+    strict_lines = []
+    loose_lines = []
+    if uniform_thrs:
+        for thr in uniform_thrs:
+            thr_map = {c: float(thr) for c in classes}
+            if not buckets:
+                strict_lines += eval_set(f"IOU={thr:.2f}", classes, samples, thr_map, device=args.device)
+                strict_lines.append("")
+            else:
+                for r0, r1 in buckets:
+                    bucket_samples = filter_samples_by_range(samples, r0, r1, axis=args.range_axis)
+                    strict_lines += eval_set(f"IOU={thr:.2f} [{r0:.0f}-{r1:.0f}]", classes, bucket_samples, thr_map, device=args.device)
+                    strict_lines.append("")
+    else:
+        if not buckets:
+            strict_lines = eval_set("STRICT", classes, samples, thr_strict, device=args.device)
+            loose_lines = eval_set("LOOSE", classes, samples, thr_loose, device=args.device)
+        else:
+            for r0, r1 in buckets:
+                bucket_samples = filter_samples_by_range(samples, r0, r1, axis=args.range_axis)
+                strict_lines += eval_set(f"STRICT [{r0:.0f}-{r1:.0f}]", classes, bucket_samples, thr_strict, device=args.device)
+                strict_lines.append("")
+                loose_lines += eval_set(f"LOOSE [{r0:.0f}-{r1:.0f}]", classes, bucket_samples, thr_loose, device=args.device)
+                loose_lines.append("")
 
     METRICS_DIR.mkdir(parents=True, exist_ok=True)
     dump_stem = dump_path.with_suffix("").name
     out_txt = METRICS_DIR / f"{dump_stem}_eval_{run_tag}.txt"
 
-    out_txt.write_text("\n".join(header + [""] + strict_lines + [""] + loose_lines) + "\n")
+    out_txt.write_text("\n".join(header + [""] + strict_lines + ([""] + loose_lines if loose_lines else [])) + "\n")
     print(f"\n[INFO] Wrote metrics txt: {out_txt}")
 
 

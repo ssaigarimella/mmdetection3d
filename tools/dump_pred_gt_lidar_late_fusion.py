@@ -37,6 +37,7 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
+import json
 
 import numpy as np
 import torch
@@ -393,6 +394,8 @@ def main() -> None:
     parser.add_argument("--veh-novatel-key", default="novatel_to_world", type=str)
     parser.add_argument("--veh-lidar2novatel-key", default="lidar_to_novatel", type=str)
     parser.add_argument("--inf-lidar2world-key", default="virtuallidar_to_world", type=str)
+    parser.add_argument("--force-transform-mask", default=None, type=str,
+                        help="Force inversion mask 'm1,m2,m3' (0/1). Overrides auto selection.")
 
     parser.add_argument("--score-thr", default=0.1, type=float)
     parser.add_argument("--outdir", required=True, type=str)
@@ -403,10 +406,33 @@ def main() -> None:
     parser.add_argument("--only-late-fusion", action="store_true")
 
     parser.add_argument("--no-native-gt", action="store_true")
+    parser.add_argument("--native-gt-subdir", default=None, type=str,
+                        help="Native GT subdir under label/ (e.g., lidar or virtuallidar).")
+    parser.add_argument("--native-gt-z-bottom", action="store_true",
+                        help="If set, treat native GT z as bottom and shift to center.")
+    parser.add_argument("--pred-z-fix", action="store_true", default=None,
+                        help="Enable prediction z-shift fix.")
+    parser.add_argument("--no-pred-z-fix", action="store_true", default=None,
+                        help="Disable prediction z-shift fix.")
     parser.add_argument("--debug-print", action="store_true")
 
     parser.add_argument("--max-samples", default=0, type=int)
     parser.add_argument("--run-eval", action="store_true")
+    parser.add_argument("--eval-classes", nargs="+", default=None,
+                        help="Subset of classes to eval, e.g., Car Pedestrian")
+    parser.add_argument("--eval-range-buckets", default="", type=str,
+                        help="Comma list like '0-30,30-50,50-100'.")
+    parser.add_argument("--eval-range-axis", default="radial", choices=["radial", "x"],
+                        help="Distance axis for range buckets.")
+    parser.add_argument("--stride", default=1, type=int, help="Process every Nth sample-id after filtering.")
+    parser.add_argument("--sample-ids", default=None, type=str,
+                        help="Comma list of sample ids or path to .txt/.json list to filter.")
+    parser.add_argument("--split-json", default=None, type=str,
+                        help="Path to DAIR split json (cooperative-split-data.json).")
+    parser.add_argument("--split-key", default="cooperative_split", type=str,
+                        help="Split json section key (e.g., cooperative_split).")
+    parser.add_argument("--split-name", default="val", type=str,
+                        help="Split name under split-key (e.g., val, train, test).")
 
     # UNION GT de-dup (prevents double-counting of the same physical object)
     parser.add_argument("--dedup-union-gt", action="store_true",
@@ -416,8 +442,42 @@ def main() -> None:
 
     args = parser.parse_args()
 
+    force_mask = None
+    if args.force_transform_mask:
+        parts = [p.strip() for p in str(args.force_transform_mask).split(",") if p.strip()]
+        if len(parts) != 3:
+            raise ValueError("--force-transform-mask must be 'm1,m2,m3' with 3 values.")
+        force_mask = (int(parts[0]), int(parts[1]), int(parts[2]))
+
+    if args.native_gt_subdir is not None:
+        V.NATIVE_LIDAR_LABEL_SUBDIR = str(args.native_gt_subdir).strip()
+    if args.native_gt_z_bottom:
+        V.NATIVE_GT_Z_IS_BOTTOM = True
+    if args.pred_z_fix is True:
+        V.FIX_PRED_Z_BY_OWN_HEIGHT = True
+    if args.no_pred_z_fix is True:
+        V.FIX_PRED_Z_BY_OWN_HEIGHT = False
+
     if (args.only_veh + args.only_inf + args.only_late_fusion) > 1:
         raise ValueError("Choose at most one of --only-veh / --only-inf / --only-late-fusion")
+
+    def _load_ids_from_arg(s: str) -> List[str]:
+        p = Path(s)
+        if p.is_file():
+            if p.suffix.lower() == ".json":
+                data = json.loads(p.read_text())
+                if isinstance(data, dict):
+                    # accept {"ids":[...]} or split json dict
+                    if "ids" in data and isinstance(data["ids"], list):
+                        return [str(x) for x in data["ids"]]
+                    return []
+                if isinstance(data, list):
+                    return [str(x) for x in data]
+                return []
+            # txt/other: one id per line
+            return [ln.strip() for ln in p.read_text().splitlines() if ln.strip()]
+        # comma-separated list
+        return [x.strip() for x in s.split(",") if x.strip()]
 
     register_all_modules(init_default_scope=True)
 
@@ -434,6 +494,29 @@ def main() -> None:
     common_ids = V.build_common_ids_in_vehicle_order(id2idx_v, id2idx_i)
     if len(common_ids) == 0:
         raise RuntimeError("No common pair-ids between vehicle and infra splits (pairing is by lidar stem).")
+
+    # optional split filter (e.g., VIC-sync)
+    if args.split_json:
+        sp = Path(args.split_json)
+        if not sp.is_file():
+            raise FileNotFoundError(f"split-json not found: {sp}")
+        split_obj = json.loads(sp.read_text())
+        split_section = split_obj.get(args.split_key, None)
+        if not isinstance(split_section, dict):
+            raise RuntimeError(f"split-key '{args.split_key}' missing in {sp}")
+        split_list = split_section.get(args.split_name, None)
+        if not isinstance(split_list, list):
+            raise RuntimeError(f"split-name '{args.split_name}' missing in {sp} under {args.split_key}")
+        split_ids = set(str(x) for x in split_list)
+        common_ids = [sid for sid in common_ids if str(sid) in split_ids]
+
+    # optional explicit ids filter
+    if args.sample_ids:
+        wanted = set(_load_ids_from_arg(args.sample_ids))
+        common_ids = [sid for sid in common_ids if str(sid) in wanted]
+
+    if args.stride and int(args.stride) > 1:
+        common_ids = common_ids[:: int(args.stride)]
 
     if args.max_samples and args.max_samples > 0:
         common_ids = common_ids[: int(args.max_samples)]
@@ -543,6 +626,7 @@ def main() -> None:
                 veh_pts_reduced=out_v["pts_reduced_pipeline"],
                 inf_pts_reduced=out_i["pts_reduced_pipeline"],
                 debug_print=bool(args.debug_print),
+                force_mask=force_mask,
             )
             T_cache[sid] = (T_veh_from_inf, src)
 
@@ -740,6 +824,11 @@ def main() -> None:
 
         for name, path in dump_paths.items():
             cmd = [sys.executable, str(eval_script), str(path), "--device", str(args.device)]
+            if args.eval_classes:
+                cmd += ["--classes"] + list(args.eval_classes)
+            if args.eval_range_buckets:
+                cmd += ["--range-buckets", str(args.eval_range_buckets)]
+                cmd += ["--range-axis", str(args.eval_range_axis)]
             rc = run_cmd(cmd, cwd=repo_root)
             if rc != 0:
                 raise RuntimeError(f"Eval failed for {name} with code {rc}")
